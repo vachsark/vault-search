@@ -64,6 +64,11 @@ def db_path_for_root(root: Path) -> Path:
     return Path.home() / ".local" / "share" / "vault-search" / f"{root_hash}.db"
 
 
+def escape_like(s: str) -> str:
+    """Escape SQL LIKE wildcards (%, _) so they match literally."""
+    return s.replace("%", "\\%").replace("_", "\\_")
+
+
 # ---------------------------------------------------------------------------
 # Math — NumPy accelerated with pure-Python fallback
 # ---------------------------------------------------------------------------
@@ -411,13 +416,13 @@ def bm25_search(
         "FROM files_fts WHERE content MATCH ? "
     )
     if path_filter:
-        base += "AND path LIKE ? "
+        base += "AND path LIKE ? ESCAPE '\\' "
     base += "ORDER BY score DESC LIMIT ?"
 
     def run(fts_expr: str) -> list[tuple[str, float]]:
         params: list = [fts_expr]
         if path_filter:
-            params.append(f"{path_filter}%")
+            params.append(f"{escape_like(path_filter)}%")
         params.append(limit)
         try:
             return conn.execute(base, params).fetchall()
@@ -557,8 +562,8 @@ def search(
     # Load file-level embeddings
     if path_filter:
         rows = conn.execute(
-            "SELECT path, embedding, embedding_norm, summary FROM files WHERE path LIKE ?",
-            (f"{path_filter}%",)
+            "SELECT path, embedding, embedding_norm, summary FROM files WHERE path LIKE ? ESCAPE '\\'",
+            (f"{escape_like(path_filter)}%",)
         ).fetchall()
     else:
         rows = conn.execute(
@@ -602,8 +607,8 @@ def search(
         if path_filter:
             chunk_rows = conn.execute(
                 "SELECT file_path, chunk_index, heading, embedding, embedding_norm "
-                "FROM chunks WHERE file_path LIKE ?",
-                (f"{path_filter}%",)
+                "FROM chunks WHERE file_path LIKE ? ESCAPE '\\'",
+                (f"{escape_like(path_filter)}%",)
             ).fetchall()
         else:
             chunk_rows = conn.execute(
