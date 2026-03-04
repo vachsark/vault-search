@@ -42,6 +42,21 @@ try:
 except ImportError:
     HAS_NUMPY = False
 
+# Cross-encoder reranker (optional: pip install sentence-transformers)
+# Auto-discover ClaudeLab venv for sentence-transformers + torch
+HAS_CROSS_ENCODER = False
+_cross_encoder = None
+_CLAUDELAB_VENV = Path.home() / "Documents/TestVault/Projects/ClaudeLab/.venv/lib"
+for _sp in sorted(_CLAUDELAB_VENV.glob("python*/site-packages"), reverse=True):
+    if str(_sp) not in sys.path:
+        sys.path.insert(0, str(_sp))
+    break
+try:
+    from sentence_transformers import CrossEncoder as _CE
+    HAS_CROSS_ENCODER = True
+except ImportError:
+    pass
+
 # ---------------------------------------------------------------------------
 # Config (all overridable via env vars)
 # ---------------------------------------------------------------------------
@@ -53,6 +68,30 @@ RERANK_MODEL = os.environ.get("RERANK_MODEL", "qwen3:8b")
 
 RERANK_TOP_N = 20   # Candidates to re-rank from retrieval stage
 RERANK_BLEND_K = 5  # Position-aware blending: top-k results trust retrieval more
+CROSS_ENCODER_MODEL = os.environ.get(
+    "CROSS_ENCODER_MODEL", "cross-encoder/ms-marco-MiniLM-L-6-v2"
+)
+
+
+def _get_cross_encoder():
+    """Lazy-load cross-encoder model (first call ~2s, subsequent calls ~0ms)."""
+    global _cross_encoder
+    if _cross_encoder is None and HAS_CROSS_ENCODER:
+        device = "cpu"
+        try:
+            import torch
+            if torch.cuda.is_available():
+                device = "cuda"
+        except ImportError:
+            pass
+        # Suppress model loading noise
+        import logging
+        logging.getLogger("sentence_transformers").setLevel(logging.WARNING)
+        try:
+            _cross_encoder = _CE(CROSS_ENCODER_MODEL, device=device)
+        except Exception:
+            pass  # Fall back to Ollama-based reranking
+    return _cross_encoder
 
 
 def db_path_for_root(root: Path) -> Path:
@@ -107,7 +146,7 @@ def vectorized_search(
     q_emb: list[float],
     query: str,
     path_filter: str | None,
-) -> list[tuple[float, str, str]]:
+) -> list[tuple[float, str, str, str | None, tuple[int, int] | None]]:
     """NumPy-accelerated cosine similarity over all embeddings.
 
     ~9x faster than the pure-Python path (14ms vs 127ms for 1600 files).
@@ -147,7 +186,7 @@ def vectorized_search(
         scores[i] += 0.15 * kw
 
     order = np.argsort(scores)[::-1]
-    return [(float(scores[idx]), paths[idx], summaries[idx]) for idx in order]
+    return [(float(scores[idx]), paths[idx], summaries[idx], None, None) for idx in order]
 
 
 def keyword_score(query: str, path: str) -> float:
@@ -250,14 +289,33 @@ _rerank_cache: dict[str, float] = {}
 def rerank_score(query: str, doc_snippet: str) -> float:
     """Score a single document's relevance to a query (0.0-1.0).
 
-    Uses the local LLM as a cross-encoder: given query + document text,
-    output a relevance score 0-10 which we normalize to 0.0-1.0.
-    ~120ms per call when model is warm.
+    Prefers cross-encoder (sentence-transformers) when available — ~66ms/pair
+    on GPU, more accurate. Falls back to Ollama LLM prompt scoring (~120ms).
     """
     cache_key = f"{query}||{doc_snippet[:100]}"
     if cache_key in _rerank_cache:
         return _rerank_cache[cache_key]
 
+    score = 0.5
+
+    # Try cross-encoder first (faster, more accurate)
+    ce = _get_cross_encoder()
+    if ce is not None:
+        try:
+            raw = float(ce.predict([(query, doc_snippet)])[0])
+            # Sigmoid to normalize raw logits to 0-1
+            score = 1.0 / (1.0 + math.exp(-raw))
+        except Exception:
+            score = _rerank_score_ollama(query, doc_snippet)
+    else:
+        score = _rerank_score_ollama(query, doc_snippet)
+
+    _rerank_cache[cache_key] = score
+    return score
+
+
+def _rerank_score_ollama(query: str, doc_snippet: str) -> float:
+    """Fallback: Ollama LLM-based relevance scoring (~120ms/pair)."""
     prompt = (
         "Rate relevance 0-10. Only output the number.\n"
         f"Query: {query}\n"
@@ -282,20 +340,17 @@ def rerank_score(query: str, doc_snippet: str) -> float:
         text = data["response"].strip()
         m = re.search(r'(\d+(?:\.\d+)?)', text)
         raw = float(m.group(1)) if m else 5.0
-        score = min(max(raw / 10.0, 0.0), 1.0)
+        return min(max(raw / 10.0, 0.0), 1.0)
     except Exception:
-        score = 0.5
-
-    _rerank_cache[cache_key] = score
-    return score
+        return 0.5
 
 
 def rerank_results(
     query: str,
-    results: list[tuple[float, str, str]],
+    results: list[tuple],
     conn: sqlite3.Connection,
     top_n: int = RERANK_TOP_N,
-) -> list[tuple[float, str, str]]:
+) -> list[tuple]:
     """Re-rank top candidates using LLM scoring with position-aware blending.
 
     Takes the top_n results from retrieval, scores each with the LLM,
@@ -309,7 +364,7 @@ def rerank_results(
     candidates = results[:top_n]
     rest = results[top_n:]
 
-    paths = [path for _, path, _ in candidates]
+    paths = [r[1] for r in candidates]
     paths_in = ", ".join("?" * len(paths))
     content_map: dict[str, str] = {}
 
@@ -349,20 +404,40 @@ def rerank_results(
             else:
                 content_map[path] = (summary or text[:400]).strip()[:400]
     except Exception:
-        for _, path, summary in candidates:
+        for candidate in candidates:
+            path, summary = candidate[1], candidate[2]
             if path not in content_map:
                 content_map[path] = (summary or path)[:400]
 
     # Normalize retrieval scores to 0-1 before blending.
     # RRF scores are tiny (~0.016-0.033), reranker scores are 0.0-1.0.
-    max_retrieval = max(s for s, _, _ in candidates) if candidates else 1.0
+    max_retrieval = max(c[0] for c in candidates) if candidates else 1.0
     if max_retrieval == 0:
         max_retrieval = 1.0
 
-    scored: list[tuple[float, float, int, str, str]] = []
-    for rank, (retrieval_score, path, summary) in enumerate(candidates):
-        snippet = content_map.get(path, summary[:400] if summary else path)
-        rr_score = rerank_score(query, snippet)
+    # Batch-score with cross-encoder if available (much faster than one-by-one)
+    snippets = []
+    for candidate in candidates:
+        path, summary = candidate[1], candidate[2]
+        snippets.append(content_map.get(path, summary[:400] if summary else path))
+
+    ce = _get_cross_encoder()
+    if ce is not None:
+        try:
+            pairs = [(query, s) for s in snippets]
+            raw_scores = ce.predict(pairs)
+            rr_scores = [1.0 / (1.0 + math.exp(-float(s))) for s in raw_scores]
+        except Exception:
+            rr_scores = [rerank_score(query, s) for s in snippets]
+    else:
+        rr_scores = [rerank_score(query, s) for s in snippets]
+
+    scored: list[tuple] = []
+    for rank, candidate in enumerate(candidates):
+        retrieval_score, path, summary = candidate[0], candidate[1], candidate[2]
+        c_heading = candidate[3] if len(candidate) > 3 else None
+        c_lines = candidate[4] if len(candidate) > 4 else None
+        rr_score = rr_scores[rank]
         norm_retrieval = retrieval_score / max_retrieval
 
         if rank < RERANK_BLEND_K:
@@ -370,10 +445,10 @@ def rerank_results(
         else:
             blended = 0.4 * norm_retrieval + 0.6 * rr_score
 
-        scored.append((blended, rr_score, rank, path, summary))
+        scored.append((blended, rr_score, rank, path, summary, c_heading, c_lines))
 
     scored.sort(key=lambda x: x[0], reverse=True)
-    reranked = [(blended, path, summary) for blended, _, _, path, summary in scored]
+    reranked = [(b, p, s, ch, cl) for b, _, _, p, s, ch, cl in scored]
 
     return reranked + rest
 
@@ -444,28 +519,35 @@ def bm25_search(
 # ---------------------------------------------------------------------------
 
 def rrf_fusion(
-    semantic: list[tuple[float, str, str]],
+    semantic: list[tuple],
     bm25: list[tuple[str, float]],
     k: int = 60,
     top_k: int = 10,
-) -> list[tuple[float, str, str]]:
+) -> list[tuple]:
     """Reciprocal Rank Fusion: merge semantic and BM25 ranked lists.
 
     Each document gets a score of sum(1 / (k + rank_i)) across all lists.
     k=60 is the standard default (Cormack et al. 2009).
+    Preserves chunk metadata (heading, line range) from semantic results.
     """
     all_docs: dict[str, dict] = {}
 
-    for rank, (score, path, summary) in enumerate(semantic):
-        all_docs.setdefault(path, {"summary": summary, "rrf": 0.0})
+    for rank, item in enumerate(semantic):
+        path, summary = item[1], item[2]
+        c_heading = item[3] if len(item) > 3 else None
+        c_lines = item[4] if len(item) > 4 else None
+        all_docs.setdefault(path, {"summary": summary, "rrf": 0.0,
+                                   "chunk_heading": c_heading, "chunk_lines": c_lines})
         all_docs[path]["rrf"] += 1.0 / (k + rank + 1)
 
     for rank, (path, score) in enumerate(bm25):
         if path not in all_docs:
-            all_docs[path] = {"summary": "", "rrf": 0.0}
+            all_docs[path] = {"summary": "", "rrf": 0.0,
+                              "chunk_heading": None, "chunk_lines": None}
         all_docs[path]["rrf"] += 1.0 / (k + rank + 1)
 
-    fused = [(v["rrf"], path, v["summary"]) for path, v in all_docs.items()]
+    fused = [(v["rrf"], path, v["summary"], v["chunk_heading"], v["chunk_lines"])
+             for path, v in all_docs.items()]
     fused.sort(reverse=True)
     return fused[:top_k]
 
@@ -482,8 +564,11 @@ def search(
     mode: str = "hybrid",
     expand: bool = False,
     rerank: bool = False,
-) -> list[tuple[float, str, str]]:
-    """Search the index. Returns list of (score, path, summary).
+) -> list[tuple]:
+    """Search the index. Returns list of (score, path, summary, chunk_heading, chunk_lines).
+
+    chunk_heading is the matched section heading (or None for file-level matches).
+    chunk_lines is (start_line, end_line) tuple (or None).
 
     mode:
       hybrid   — semantic + BM25 via Reciprocal Rank Fusion (default)
@@ -535,7 +620,7 @@ def search(
         for p, s in rows:
             summary_map[p] = s or ""
         conn.close()
-        return [(score, path, summary_map.get(path, ""))
+        return [(score, path, summary_map.get(path, ""), None, None)
                 for path, score in bm25_results[:top_k]]
 
     # Get query embedding
@@ -583,7 +668,7 @@ def search(
         semantic_results = vectorized_search(rows, q_emb, query, path_filter)
     else:
         q_norm = norm(q_emb)
-        semantic_results: list[tuple[float, str, str]] = []
+        semantic_results: list[tuple] = []
         for path, emb_data, emb_norm, summary in rows:
             try:
                 if isinstance(emb_data, bytes):
@@ -599,25 +684,28 @@ def search(
                 cos = dot(q_emb, emb) / (q_norm * emb_norm)
             kw = keyword_score(query, path)
             score = cos + 0.15 * kw
-            semantic_results.append((score, path, summary or ""))
+            semantic_results.append((score, path, summary or "", None, None))
         semantic_results.sort(key=lambda x: x[0], reverse=True)
 
-    # Chunk-level search
+    # Chunk-level search — find the best matching chunk per file
     if has_chunks:
         if path_filter:
             chunk_rows = conn.execute(
-                "SELECT file_path, chunk_index, heading, embedding, embedding_norm "
+                "SELECT file_path, chunk_index, heading, start_line, end_line, "
+                "embedding, embedding_norm "
                 "FROM chunks WHERE file_path LIKE ? ESCAPE '\\'",
                 (f"{escape_like(path_filter)}%",)
             ).fetchall()
         else:
             chunk_rows = conn.execute(
-                "SELECT file_path, chunk_index, heading, embedding, embedding_norm "
+                "SELECT file_path, chunk_index, heading, start_line, end_line, "
+                "embedding, embedding_norm "
                 "FROM chunks"
             ).fetchall()
 
         if chunk_rows:
-            best_chunk_score: dict[str, tuple[float, str | None]] = {}
+            # Track best chunk per file: (score, heading, start_line, end_line)
+            best_chunk: dict[str, tuple[float, str | None, int | None, int | None]] = {}
 
             if HAS_NUMPY:
                 n_chunks = len(chunk_rows)
@@ -626,8 +714,10 @@ def search(
                 chunk_norms = np.zeros(n_chunks, dtype=np.float32)
                 chunk_paths = []
                 chunk_headings = []
+                chunk_starts = []
+                chunk_ends = []
 
-                for i, (fp, ci, heading, blob, cnorm) in enumerate(chunk_rows):
+                for i, (fp, ci, heading, sline, eline, blob, cnorm) in enumerate(chunk_rows):
                     if len(blob) == dims * 8:
                         chunk_matrix[i] = np.frombuffer(blob, dtype=np.float64).astype(np.float32)
                     else:
@@ -635,6 +725,8 @@ def search(
                     chunk_norms[i] = cnorm or 0.0
                     chunk_paths.append(fp)
                     chunk_headings.append(heading)
+                    chunk_starts.append(sline)
+                    chunk_ends.append(eline)
 
                 q_vec = np.array(q_emb, dtype=np.float32)
                 q_n = np.linalg.norm(q_vec)
@@ -647,11 +739,12 @@ def search(
                     for i in range(n_chunks):
                         fp = chunk_paths[i]
                         score = float(cosines[i]) + 0.15 * keyword_score(query, fp)
-                        if fp not in best_chunk_score or score > best_chunk_score[fp][0]:
-                            best_chunk_score[fp] = (score, chunk_headings[i])
+                        if fp not in best_chunk or score > best_chunk[fp][0]:
+                            best_chunk[fp] = (score, chunk_headings[i],
+                                              chunk_starts[i], chunk_ends[i])
             else:
                 q_n = norm(q_emb)
-                for fp, ci, heading, blob, cnorm in chunk_rows:
+                for fp, ci, heading, sline, eline, blob, cnorm in chunk_rows:
                     try:
                         emb = unpack_embedding(blob)
                     except Exception:
@@ -661,18 +754,23 @@ def search(
                     else:
                         cos = dot(q_emb, emb) / (q_n * cnorm)
                     score = cos + 0.15 * keyword_score(query, fp)
-                    if fp not in best_chunk_score or score > best_chunk_score[fp][0]:
-                        best_chunk_score[fp] = (score, heading)
+                    if fp not in best_chunk or score > best_chunk[fp][0]:
+                        best_chunk[fp] = (score, heading, sline, eline)
 
-            file_scores: dict[str, float] = {path: score for score, path, _ in semantic_results}
-            for fp, (chunk_score, heading) in best_chunk_score.items():
-                current = file_scores.get(fp, 0.0)
+            # Merge: if chunk score > file score, promote and carry metadata
+            file_data: dict[str, tuple[float, str | None, int | None, int | None]] = {}
+            for item in semantic_results:
+                file_data[item[1]] = (item[0], None, None, None)
+
+            for fp, (chunk_score, heading, sline, eline) in best_chunk.items():
+                current = file_data.get(fp, (0.0, None, None, None))[0]
                 if chunk_score > current:
-                    file_scores[fp] = chunk_score
+                    file_data[fp] = (chunk_score, heading, sline, eline)
 
             semantic_results = [
-                (score, path, summary_map.get(path, ""))
-                for path, score in file_scores.items()
+                (score, path, summary_map.get(path, ""), heading,
+                 (sline, eline) if sline is not None else None)
+                for path, (score, heading, sline, eline) in file_data.items()
             ]
             semantic_results.sort(key=lambda x: x[0], reverse=True)
 
@@ -780,19 +878,33 @@ def main() -> None:
 
     if args.json:
         output = []
-        for score, path, summary in results:
-            output.append({
+        for result in results:
+            score, path, summary = result[0], result[1], result[2]
+            c_heading = result[3] if len(result) > 3 else None
+            c_lines = result[4] if len(result) > 4 else None
+            entry = {
                 "score": round(score, 4),
                 "path": path,
                 "summary": summary,
-            })
+            }
+            if c_heading:
+                entry["chunk_heading"] = c_heading
+            if c_lines:
+                entry["chunk_lines"] = list(c_lines)
+            output.append(entry)
         print(json.dumps(output, indent=2))
     else:
-        for score, path, summary in results:
+        for result in results:
+            score, path, summary = result[0], result[1], result[2]
+            c_heading = result[3] if len(result) > 3 else None
+            c_lines = result[4] if len(result) > 4 else None
             short_summary = summary.replace("\n", " ").strip()
             if len(short_summary) > 100:
                 short_summary = short_summary[:97] + "..."
             print(f"{score:.4f}  {path}")
+            if c_heading:
+                line_info = f" (lines {c_lines[0]}-{c_lines[1]})" if c_lines else ""
+                print(f"        \u00a7 {c_heading}{line_info}")
             print(f"        {short_summary}")
             print()
 
