@@ -15,6 +15,15 @@ Usage:
     python3 vault-search.py "getTenantId" --mode bm25
     python3 vault-search.py "auth patterns" --rerank        # LLM re-ranking
     python3 vault-search.py "auth patterns" --expand --rerank  # full pipeline
+    python3 vault-search.py "attention" --intent "machine learning"  # intent steering
+    python3 vault-search.py 'lex:"reciprocal rank" vec:search fusion' # typed sub-queries
+    python3 vault-search.py "auth patterns" --explain        # scoring details
+
+Typed sub-queries:
+    lex:"term"     BM25 keyword search for that term
+    vec:"concept"  Embedding similarity search for that concept
+    hyde:"question" HyDE expansion search for that question
+    (unprefixed)   Normal hybrid search
 
 Environment variables:
     OLLAMA_BASE       Ollama API URL (default: http://localhost:11434)
@@ -33,6 +42,7 @@ import re
 import sqlite3
 import struct
 import sys
+import time
 import urllib.request
 from pathlib import Path
 
@@ -246,16 +256,20 @@ def ollama_embed(text: str) -> list[float]:
     return emb
 
 
-def hyde_expand(query: str) -> str:
+def hyde_expand(query: str, intent: str | None = None) -> str:
     """HyDE: generate a hypothetical document to improve embedding alignment.
 
     Instead of embedding the raw query, we ask the local LLM to generate a
     short passage that WOULD answer the query, then embed that. Document-to-
     document similarity is more reliable than question-to-document.
+
+    When intent is provided, it steers the expansion toward the right domain
+    (e.g., "attention" + intent="machine learning" → ML attention, not UX).
     """
+    intent_ctx = f" in the context of {intent}" if intent else ""
     prompt = (
         f"Write a short technical passage (2-3 sentences or a brief code snippet) "
-        f"that directly answers or demonstrates: {query}\n"
+        f"that directly answers or demonstrates: {query}{intent_ctx}\n"
         f"Be specific. Use technical terminology. No preamble."
     )
     payload = json.dumps({
@@ -286,13 +300,14 @@ def hyde_expand(query: str) -> str:
 _rerank_cache: dict[str, float] = {}
 
 
-def rerank_score(query: str, doc_snippet: str) -> float:
+def rerank_score(query: str, doc_snippet: str, intent: str | None = None) -> float:
     """Score a single document's relevance to a query (0.0-1.0).
 
     Prefers cross-encoder (sentence-transformers) when available — ~66ms/pair
     on GPU, more accurate. Falls back to Ollama LLM prompt scoring (~120ms).
     """
-    cache_key = f"{query}||{doc_snippet[:100]}"
+    effective_query = f"{query} ({intent})" if intent else query
+    cache_key = f"{effective_query}||{doc_snippet[:100]}"
     if cache_key in _rerank_cache:
         return _rerank_cache[cache_key]
 
@@ -302,23 +317,24 @@ def rerank_score(query: str, doc_snippet: str) -> float:
     ce = _get_cross_encoder()
     if ce is not None:
         try:
-            raw = float(ce.predict([(query, doc_snippet)])[0])
+            raw = float(ce.predict([(effective_query, doc_snippet)])[0])
             # Sigmoid to normalize raw logits to 0-1
             score = 1.0 / (1.0 + math.exp(-raw))
         except Exception:
-            score = _rerank_score_ollama(query, doc_snippet)
+            score = _rerank_score_ollama(query, doc_snippet, intent)
     else:
-        score = _rerank_score_ollama(query, doc_snippet)
+        score = _rerank_score_ollama(query, doc_snippet, intent)
 
     _rerank_cache[cache_key] = score
     return score
 
 
-def _rerank_score_ollama(query: str, doc_snippet: str) -> float:
+def _rerank_score_ollama(query: str, doc_snippet: str, intent: str | None = None) -> float:
     """Fallback: Ollama LLM-based relevance scoring (~120ms/pair)."""
+    intent_line = f"\nIntent: {intent}" if intent else ""
     prompt = (
         "Rate relevance 0-10. Only output the number.\n"
-        f"Query: {query}\n"
+        f"Query: {query}{intent_line}\n"
         f"Document: {doc_snippet}\n"
         "Score:"
     )
@@ -350,6 +366,7 @@ def rerank_results(
     results: list[tuple],
     conn: sqlite3.Connection,
     top_n: int = RERANK_TOP_N,
+    intent: str | None = None,
 ) -> list[tuple]:
     """Re-rank top candidates using LLM scoring with position-aware blending.
 
@@ -421,16 +438,17 @@ def rerank_results(
         path, summary = candidate[1], candidate[2]
         snippets.append(content_map.get(path, summary[:400] if summary else path))
 
+    effective_query = f"{query} ({intent})" if intent else query
     ce = _get_cross_encoder()
     if ce is not None:
         try:
-            pairs = [(query, s) for s in snippets]
+            pairs = [(effective_query, s) for s in snippets]
             raw_scores = ce.predict(pairs)
             rr_scores = [1.0 / (1.0 + math.exp(-float(s))) for s in raw_scores]
         except Exception:
-            rr_scores = [rerank_score(query, s) for s in snippets]
+            rr_scores = [rerank_score(query, s, intent) for s in snippets]
     else:
-        rr_scores = [rerank_score(query, s) for s in snippets]
+        rr_scores = [rerank_score(query, s, intent) for s in snippets]
 
     scored: list[tuple] = []
     for rank, candidate in enumerate(candidates):
@@ -556,6 +574,75 @@ def rrf_fusion(
 # Search
 # ---------------------------------------------------------------------------
 
+def _fallback_semantic(
+    rows: list,
+    q_emb: list[float],
+    query: str,
+) -> list[tuple]:
+    """Pure-Python semantic search fallback (no NumPy)."""
+    q_norm_val = norm(q_emb)
+    results: list[tuple] = []
+    for path, emb_data, emb_norm, summary in rows:
+        try:
+            if isinstance(emb_data, bytes):
+                emb = unpack_embedding(emb_data)
+            else:
+                emb = json.loads(emb_data)
+                emb_norm = norm(emb)
+        except (json.JSONDecodeError, TypeError, struct.error):
+            continue
+        if q_norm_val == 0 or (emb_norm or 0) == 0:
+            cos = 0.0
+        else:
+            cos = dot(q_emb, emb) / (q_norm_val * emb_norm)
+        kw = keyword_score(query, path)
+        score = cos + 0.15 * kw
+        results.append((score, path, summary or "", None, None))
+    results.sort(key=lambda x: x[0], reverse=True)
+    return results
+
+
+def _print_explain(log: list[str], results: list[tuple]) -> None:
+    """Print explain log and per-result scoring details to stderr."""
+    print("\n--- EXPLAIN ---", file=sys.stderr)
+    for line in log:
+        print(f"  {line}", file=sys.stderr)
+    print("", file=sys.stderr)
+    print("  Per-result scores:", file=sys.stderr)
+    for i, result in enumerate(results[:20]):
+        score, path = result[0], result[1]
+        c_heading = result[3] if len(result) > 3 else None
+        heading_info = f" § {c_heading}" if c_heading else ""
+        print(f"  {i+1:3d}. {score:.4f}  {path}{heading_info}", file=sys.stderr)
+    print("--- END EXPLAIN ---\n", file=sys.stderr)
+
+
+def parse_typed_subqueries(query: str) -> dict[str, list[str]]:
+    """Parse typed sub-query prefixes from a query string.
+
+    Supports lex:"term", vec:"concept", hyde:"question" prefixes.
+    Unprefixed text is collected under the "plain" key.
+
+    Returns {"lex": [...], "vec": [...], "hyde": [...], "plain": [...]}.
+    """
+    result: dict[str, list[str]] = {"lex": [], "vec": [], "hyde": [], "plain": []}
+
+    # Match lex:"...", vec:"...", hyde:"..." (with or without quotes)
+    pattern = r'(lex|vec|hyde):(?:"([^"]+)"|(\S+))'
+    remainder = query
+    for match in re.finditer(pattern, query):
+        prefix = match.group(1)
+        value = match.group(2) or match.group(3)
+        result[prefix].append(value)
+        remainder = remainder.replace(match.group(0), "", 1)
+
+    plain = remainder.strip()
+    if plain:
+        result["plain"].append(plain)
+
+    return result
+
+
 def search(
     query: str,
     db_path: Path,
@@ -564,6 +651,8 @@ def search(
     mode: str = "hybrid",
     expand: bool = False,
     rerank: bool = False,
+    intent: str | None = None,
+    explain: bool = False,
 ) -> list[tuple]:
     """Search the index. Returns list of (score, path, summary, chunk_heading, chunk_lines).
 
@@ -582,7 +671,22 @@ def search(
     rerank:
       Re-scores top candidates using LLM-based relevance scoring.
       Adds ~2-3s but significantly improves result quality.
+
+    intent:
+      Domain context that steers expansion, reranking, and snippet
+      extraction (e.g., "machine learning" disambiguates "attention").
+
+    explain:
+      When True, prints scoring details at each pipeline stage to stderr.
     """
+    explain_log: list[str] = []  # Collect explain output
+    t_start = time.time()
+
+    def _explain(msg: str) -> None:
+        if explain:
+            elapsed = (time.time() - t_start) * 1000
+            explain_log.append(f"[{elapsed:7.1f}ms] {msg}")
+
     if not db_path.exists():
         print(f"Error: Index not found at {db_path}.", file=sys.stderr)
         print("Run vault-index.py first to build the index.", file=sys.stderr)
@@ -596,6 +700,118 @@ def search(
         conn.execute("ALTER TABLE files ADD COLUMN embedding_norm REAL")
         conn.commit()
 
+    _explain(f"DB opened: {db_path}")
+    if intent:
+        _explain(f"Intent: {intent}")
+
+    # --- Typed sub-query handling ---
+    subqueries = parse_typed_subqueries(query)
+    has_typed = any(subqueries[k] for k in ("lex", "vec", "hyde"))
+
+    if has_typed:
+        _explain(f"Typed sub-queries: lex={subqueries['lex']} vec={subqueries['vec']} "
+                 f"hyde={subqueries['hyde']} plain={subqueries['plain']}")
+
+        # Run each sub-query type through its pipeline, collect results for RRF
+        all_ranked_lists: list[list[tuple]] = []
+        all_bm25_lists: list[list[tuple[str, float]]] = []
+
+        # lex: sub-queries → BM25 only
+        for lq in subqueries["lex"]:
+            t0 = time.time()
+            bm25_res = bm25_search(conn, lq, path_filter, limit=top_k * 4)
+            _explain(f"lex:\"{lq}\" → {len(bm25_res)} BM25 results ({(time.time()-t0)*1000:.0f}ms)")
+            all_bm25_lists.append(bm25_res)
+
+        # Load embeddings once for vec/hyde/plain queries
+        if path_filter:
+            rows = conn.execute(
+                "SELECT path, embedding, embedding_norm, summary FROM files WHERE path LIKE ? ESCAPE '\\'",
+                (f"{escape_like(path_filter)}%",)
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT path, embedding, embedding_norm, summary FROM files"
+            ).fetchall()
+        summary_map = {path: (summary or "") for path, _, _, summary in rows}
+
+        # vec: sub-queries → embedding search only
+        for vq in subqueries["vec"]:
+            t0 = time.time()
+            vq_emb = ollama_embed(vq)
+            if HAS_NUMPY and all(isinstance(r[1], bytes) for r in rows[:10]):
+                sem = vectorized_search(rows, vq_emb, vq, path_filter)
+            else:
+                sem = _fallback_semantic(rows, vq_emb, vq)
+            _explain(f"vec:\"{vq}\" → {len(sem)} semantic results ({(time.time()-t0)*1000:.0f}ms)")
+            all_ranked_lists.append(sem)
+
+        # hyde: sub-queries → HyDE expansion + embedding search
+        for hq in subqueries["hyde"]:
+            t0 = time.time()
+            expanded = hyde_expand(hq, intent)
+            hq_emb = ollama_embed(expanded)
+            if HAS_NUMPY and all(isinstance(r[1], bytes) for r in rows[:10]):
+                sem = vectorized_search(rows, hq_emb, hq, path_filter)
+            else:
+                sem = _fallback_semantic(rows, hq_emb, hq)
+            _explain(f"hyde:\"{hq}\" → expanded + {len(sem)} semantic results ({(time.time()-t0)*1000:.0f}ms)")
+            all_ranked_lists.append(sem)
+
+        # plain text → normal hybrid
+        for pq in subqueries["plain"]:
+            t0 = time.time()
+            pq_emb = ollama_embed(pq)
+            if HAS_NUMPY and all(isinstance(r[1], bytes) for r in rows[:10]):
+                sem = vectorized_search(rows, pq_emb, pq, path_filter)
+            else:
+                sem = _fallback_semantic(rows, pq_emb, pq)
+            bm25_res = bm25_search(conn, pq, path_filter, limit=top_k * 4)
+            all_ranked_lists.append(sem)
+            all_bm25_lists.append(bm25_res)
+            _explain(f"plain:\"{pq}\" → {len(sem)} semantic + {len(bm25_res)} BM25 ({(time.time()-t0)*1000:.0f}ms)")
+
+        # Multi-list RRF fusion
+        all_docs: dict[str, dict] = {}
+        for ranked_list in all_ranked_lists:
+            for rank, item in enumerate(ranked_list):
+                path, summary = item[1], item[2]
+                c_heading = item[3] if len(item) > 3 else None
+                c_lines = item[4] if len(item) > 4 else None
+                all_docs.setdefault(path, {"summary": summary, "rrf": 0.0,
+                                           "chunk_heading": c_heading, "chunk_lines": c_lines})
+                all_docs[path]["rrf"] += 1.0 / (60 + rank + 1)
+
+        for bm25_list in all_bm25_lists:
+            for rank, (path, score) in enumerate(bm25_list):
+                if path not in all_docs:
+                    all_docs[path] = {"summary": summary_map.get(path, ""), "rrf": 0.0,
+                                      "chunk_heading": None, "chunk_lines": None}
+                all_docs[path]["rrf"] += 1.0 / (60 + rank + 1)
+
+        fused = [(v["rrf"], path, v["summary"], v["chunk_heading"], v["chunk_lines"])
+                 for path, v in all_docs.items()]
+        fused.sort(reverse=True)
+        fused = fused[:max(top_k, RERANK_TOP_N) if rerank else top_k]
+
+        _explain(f"Multi-list RRF fusion → {len(fused)} candidates")
+
+        if rerank:
+            _explain("Re-ranking...")
+            t0 = time.time()
+            reranked = rerank_results(query, fused, conn, intent=intent)
+            _explain(f"Re-ranking done ({(time.time()-t0)*1000:.0f}ms)")
+            fused = reranked[:top_k]
+
+        if explain:
+            _explain(f"Final: {len(fused)} results")
+            _print_explain(explain_log, fused)
+
+        conn.close()
+        return fused
+
+    # --- Standard (non-typed) search path ---
+
     # BM25-only path
     if mode == "bm25":
         words = [w for w in re.findall(r'\w+', query.lower()) if len(w) >= 3]
@@ -604,7 +820,9 @@ def search(
                   f"Try --mode semantic for short queries.", file=sys.stderr)
             conn.close()
             return []
+        t0 = time.time()
         bm25_results = bm25_search(conn, query, path_filter, limit=top_k * 3)
+        _explain(f"BM25 search → {len(bm25_results)} results ({(time.time()-t0)*1000:.0f}ms)")
         if not bm25_results:
             print("No BM25 results found. Try --mode semantic or re-run vault-index.py.",
                   file=sys.stderr)
@@ -619,22 +837,31 @@ def search(
         ).fetchall()
         for p, s in rows:
             summary_map[p] = s or ""
+
+        results = [(score, path, summary_map.get(path, ""), None, None)
+                   for path, score in bm25_results[:top_k]]
+        if explain:
+            _explain(f"Final: {len(results)} results")
+            _print_explain(explain_log, results)
         conn.close()
-        return [(score, path, summary_map.get(path, ""), None, None)
-                for path, score in bm25_results[:top_k]]
+        return results
 
     # Get query embedding
     embed_query = query
     if expand:
         print("Expanding query with HyDE...", file=sys.stderr)
-        embed_query = hyde_expand(query)
+        t0 = time.time()
+        embed_query = hyde_expand(query, intent)
+        _explain(f"HyDE expansion ({(time.time()-t0)*1000:.0f}ms): {embed_query[:100]}...")
 
+    t0 = time.time()
     try:
         q_emb = ollama_embed(embed_query)
     except Exception as e:
         print(f"Error: Cannot reach Ollama at {OLLAMA_BASE}: {e}", file=sys.stderr)
         print("Make sure Ollama is running: ollama serve", file=sys.stderr)
         sys.exit(1)
+    _explain(f"Embedding query ({(time.time()-t0)*1000:.0f}ms)")
 
     # Check chunks
     has_chunks = False
@@ -661,9 +888,11 @@ def search(
         conn.close()
         sys.exit(1)
 
+    _explain(f"Loaded {len(rows)} file embeddings" + (f", {chunk_count} chunks" if has_chunks else ""))
     summary_map = {path: (summary or "") for path, _, _, summary in rows}
 
     # Score all files
+    t0 = time.time()
     if HAS_NUMPY and all(isinstance(r[1], bytes) for r in rows[:10]):
         semantic_results = vectorized_search(rows, q_emb, query, path_filter)
     else:
@@ -686,6 +915,9 @@ def search(
             score = cos + 0.15 * kw
             semantic_results.append((score, path, summary or "", None, None))
         semantic_results.sort(key=lambda x: x[0], reverse=True)
+
+    _explain(f"Semantic search → {len(semantic_results)} results, "
+             f"top={semantic_results[0][0]:.4f} ({(time.time()-t0)*1000:.0f}ms)")
 
     # Chunk-level search — find the best matching chunk per file
     if has_chunks:
@@ -777,36 +1009,69 @@ def search(
     if mode == "semantic":
         if rerank:
             print("Re-ranking with LLM...", file=sys.stderr)
-            reranked = rerank_results(query, semantic_results[:top_k * 4], conn)
+            t0 = time.time()
+            reranked = rerank_results(query, semantic_results[:top_k * 4], conn, intent=intent)
+            _explain(f"Re-ranking ({(time.time()-t0)*1000:.0f}ms)")
+            results = reranked[:top_k]
+            if explain:
+                _explain(f"Final: {len(results)} results (semantic + rerank)")
+                _print_explain(explain_log, results)
             conn.close()
-            return reranked[:top_k]
+            return results
+        results = semantic_results[:top_k]
+        if explain:
+            _explain(f"Final: {len(results)} results (semantic only)")
+            _print_explain(explain_log, results)
         conn.close()
-        return semantic_results[:top_k]
+        return results
 
     # Hybrid: fuse semantic + BM25 via RRF
     candidate_k = max(top_k * 4, 50)
+    t0 = time.time()
     bm25_results = bm25_search(conn, query, path_filter, limit=candidate_k)
+    _explain(f"BM25 search → {len(bm25_results)} results ({(time.time()-t0)*1000:.0f}ms)")
 
     if not bm25_results:
         if rerank:
             print("Re-ranking with LLM...", file=sys.stderr)
-            reranked = rerank_results(query, semantic_results[:top_k * 4], conn)
+            t0 = time.time()
+            reranked = rerank_results(query, semantic_results[:top_k * 4], conn, intent=intent)
+            _explain(f"Re-ranking ({(time.time()-t0)*1000:.0f}ms)")
+            results = reranked[:top_k]
+            if explain:
+                _explain(f"Final: {len(results)} results (semantic + rerank, no BM25)")
+                _print_explain(explain_log, results)
             conn.close()
-            return reranked[:top_k]
+            return results
+        results = semantic_results[:top_k]
+        if explain:
+            _explain(f"Final: {len(results)} results (semantic only, no BM25)")
+            _print_explain(explain_log, results)
         conn.close()
-        return semantic_results[:top_k]
+        return results
 
     fused = rrf_fusion(
         semantic_results[:candidate_k],
         bm25_results,
         top_k=max(top_k, RERANK_TOP_N) if rerank else top_k,
     )
+    _explain(f"RRF fusion → {len(fused)} candidates")
 
     if rerank:
         print("Re-ranking with LLM...", file=sys.stderr)
-        reranked = rerank_results(query, fused, conn)
+        t0 = time.time()
+        reranked = rerank_results(query, fused, conn, intent=intent)
+        _explain(f"Re-ranking ({(time.time()-t0)*1000:.0f}ms)")
+        results = reranked[:top_k]
+        if explain:
+            _explain(f"Final: {len(results)} results (hybrid + rerank)")
+            _print_explain(explain_log, results)
         conn.close()
-        return reranked[:top_k]
+        return results
+
+    if explain:
+        _explain(f"Final: {len(fused)} results (hybrid)")
+        _print_explain(explain_log, fused)
 
     conn.close()
     return fused
@@ -858,6 +1123,16 @@ def main() -> None:
         help="Re-rank top candidates using LLM scoring (adds ~2-3s, "
              "significantly improves quality)"
     )
+    parser.add_argument(
+        "--intent", type=str, default=None,
+        help="Domain context to steer search (e.g., 'machine learning' "
+             "disambiguates 'attention'). Affects expansion, reranking, "
+             "and snippet extraction."
+    )
+    parser.add_argument(
+        "--explain", action="store_true",
+        help="Show scoring details at each pipeline stage (for debugging)"
+    )
     args = parser.parse_args()
 
     root = Path(args.root).resolve()
@@ -874,6 +1149,8 @@ def main() -> None:
         mode=args.mode,
         expand=args.expand,
         rerank=args.rerank,
+        intent=args.intent,
+        explain=args.explain,
     )
 
     if args.json:

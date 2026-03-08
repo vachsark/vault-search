@@ -43,9 +43,9 @@ MAX_CONTENT_CHARS = 8000
 FTS_CONTENT_CHARS = 50_000
 
 # Chunking config
-MAX_CHUNK_CHARS = 6000
+MAX_CHUNK_CHARS = 2000
 MIN_CHUNK_CHARS = 200
-OVERLAP_CHARS = 200
+OVERLAP_CHARS = 300
 
 SKIP_DIRS = {
     "node_modules", ".git", ".next", "dist", "build",
@@ -503,7 +503,6 @@ def run_index(vault_root: Path, sub_path: Path | None, db_path: Path,
     if pruned:
         print(f"Pruned {pruned} deleted files from index")
     migrate_fts(conn, vault_root)
-
     files = collect_files(root)
     if test_mode:
         files = files[:5]
