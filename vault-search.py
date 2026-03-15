@@ -5,8 +5,13 @@
 vault-search.py — Local semantic search over files indexed by vault-index.py.
 
 Hybrid search (BM25 + embeddings + Reciprocal Rank Fusion) with optional
-LLM re-ranking and HyDE query expansion. Runs entirely on your machine
-via Ollama — no API cost, no data leaves your network.
+LLM re-ranking, HyDE query expansion, and knowledge graph context.
+Runs entirely on your machine via Ollama — no API cost, no data leaves
+your network.
+
+When entity/relation tables are present (populated by vault-graph.py),
+search results automatically include a "Graph Context" section showing
+how matching concepts connect to each other.
 
 Usage:
     python3 vault-search.py "authentication middleware"
@@ -46,6 +51,13 @@ import time
 import urllib.request
 from pathlib import Path
 
+# Auto-discover ClaudeLab venv for numpy, sentence-transformers, torch
+_CLAUDELAB_VENV = Path.home() / "Documents/TestVault/Projects/ClaudeLab/.venv/lib"
+for _sp in sorted(_CLAUDELAB_VENV.glob("python*/site-packages"), reverse=True):
+    if str(_sp) not in sys.path:
+        sys.path.insert(0, str(_sp))
+    break
+
 try:
     import numpy as np
     HAS_NUMPY = True
@@ -53,14 +65,8 @@ except ImportError:
     HAS_NUMPY = False
 
 # Cross-encoder reranker (optional: pip install sentence-transformers)
-# Auto-discover ClaudeLab venv for sentence-transformers + torch
 HAS_CROSS_ENCODER = False
 _cross_encoder = None
-_CLAUDELAB_VENV = Path.home() / "Documents/TestVault/Projects/ClaudeLab/.venv/lib"
-for _sp in sorted(_CLAUDELAB_VENV.glob("python*/site-packages"), reverse=True):
-    if str(_sp) not in sys.path:
-        sys.path.insert(0, str(_sp))
-    break
 try:
     from sentence_transformers import CrossEncoder as _CE
     HAS_CROSS_ENCODER = True
@@ -1080,6 +1086,151 @@ def search(
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
+# Graph context — entity/relation lookup from vault-graph tables
+# ---------------------------------------------------------------------------
+
+# Relation normalization (matches vault-graph.py)
+_RELATION_MAP = {
+    "builds_on": "builds_on", "based_on": "builds_on", "is_based_on": "builds_on",
+    "derives_from": "builds_on", "derived_from": "builds_on", "draws_from": "builds_on",
+    "inspired_by": "builds_on", "influenced_by": "builds_on",
+    "contradicts": "contradicts", "contrasts_with": "contradicts", "competes_with": "contradicts",
+    "differs_from": "contradicts", "refutes": "contradicts",
+    "applies_to": "applies_to", "applies": "applies_to", "used_in": "applies_to",
+    "used_for": "applies_to", "used_by": "applies_to",
+    "implements": "implements", "implemented_by": "implements", "formalizes": "implements",
+    "extends": "extends", "generalizes": "extends", "variant_of": "extends",
+    "part_of": "part_of", "is_part_of": "part_of", "includes": "part_of",
+    "contains": "part_of", "comprises": "part_of", "component_of": "part_of",
+    "uses": "uses", "employs": "uses", "requires": "uses", "depends_on": "uses",
+    "enables": "enables", "facilitates": "enables", "supports": "enables",
+    "leads_to": "enables", "drives": "enables",
+    "causes": "causes", "triggers": "causes", "affects": "causes",
+    "modulates": "causes", "inhibits": "causes",
+    "explains": "explains", "describes": "explains", "defines": "explains",
+    "predicts": "explains", "demonstrates": "explains",
+    "developed_by": "developed_by", "created_by": "developed_by",
+    "coined_by": "developed_by", "proposed_by": "developed_by",
+    "type_of": "type_of", "is_type_of": "type_of", "is_a": "type_of",
+    "instance_of": "type_of", "example_of": "type_of",
+    "complements": "complements", "combines": "complements",
+    "integrates_with": "complements", "bridges": "complements",
+}
+
+def _norm_rel(r: str) -> str:
+    return _RELATION_MAP.get(r, "relates_to")
+
+
+def graph_context(db_path: Path, query: str, result_paths: list[str]) -> str | None:
+    """Look up graph entities related to the query and result files.
+
+    Returns a formatted string of entity connections, or None if no graph
+    tables exist or no entities match.
+    """
+    try:
+        conn = sqlite3.connect(str(db_path))
+        # Check if graph tables exist
+        tables = {r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()}
+        if "entities" not in tables or "relations" not in tables:
+            conn.close()
+            return None
+
+        # Find entities matching the query
+        query_lower = query.lower().strip()
+        query_words = [w for w in query_lower.split() if len(w) > 2]
+        matched_entities = {}  # entity -> relevance score
+
+        # 1. Exact/full phrase match (highest priority)
+        rows = conn.execute(
+            "SELECT DISTINCT name FROM entities WHERE name LIKE ?",
+            (f"%{query_lower}%",)
+        ).fetchall()
+        for r in rows:
+            matched_entities[r[0]] = matched_entities.get(r[0], 0) + 10
+
+        # 2. Individual word matches (only if word is 4+ chars to reduce noise)
+        for word in query_words:
+            if len(word) < 4:
+                continue
+            rows = conn.execute(
+                "SELECT DISTINCT name FROM entities WHERE name LIKE ?",
+                (f"%{word}%",)
+            ).fetchall()
+            for r in rows:
+                # Only count if entity name actually contains the word as a
+                # meaningful match (not just a substring of a longer word)
+                ename = r[0]
+                if word in ename.split() or ename.startswith(word) or ename.endswith(word):
+                    matched_entities[ename] = matched_entities.get(ename, 0) + 1
+
+        # Also find entities from top result files (low weight — just for context)
+        result_filenames = [os.path.basename(p) for p in result_paths[:3]]
+        for fname in result_filenames:
+            rows = conn.execute(
+                "SELECT DISTINCT name FROM entities WHERE source_file = ?",
+                (fname,)
+            ).fetchall()
+            for r in rows:
+                # Only add if already matched by query (don't introduce new entities)
+                if r[0] in matched_entities:
+                    matched_entities[r[0]] = matched_entities.get(r[0], 0) + 1
+
+        if not matched_entities:
+            conn.close()
+            return None
+
+        # Rank entities: relevance for sorting, raw connection count for display
+        entity_info = {}  # {name: (sort_score, raw_connections)}
+        for ent, relevance in matched_entities.items():
+            count = conn.execute(
+                "SELECT COUNT(*) FROM (SELECT id FROM relations WHERE source_entity=? "
+                "UNION ALL SELECT id FROM relations WHERE target_entity=?)",
+                (ent, ent)
+            ).fetchone()[0]
+            entity_info[ent] = (relevance * max(count, 1), count)
+
+        top_entities = sorted(entity_info, key=lambda e: entity_info[e][0], reverse=True)[:6]
+
+        lines = []
+        for ent in top_entities:
+            # Get type
+            etype = conn.execute(
+                "SELECT type FROM entities WHERE name = ? LIMIT 1", (ent,)
+            ).fetchone()
+            etype = etype[0] if etype else "concept"
+
+            raw_connections = entity_info[ent][1]
+            lines.append(f"  {ent} ({etype}, {raw_connections} connections)")
+
+            # Get top relations (outgoing)
+            outgoing = conn.execute(
+                "SELECT relation, target_entity FROM relations WHERE source_entity = ? LIMIT 5",
+                (ent,)
+            ).fetchall()
+            for rel, target in outgoing:
+                lines.append(f"    → {_norm_rel(rel)} → {target}")
+
+            # Get top relations (incoming)
+            incoming = conn.execute(
+                "SELECT source_entity, relation FROM relations WHERE target_entity = ? LIMIT 3",
+                (ent,)
+            ).fetchall()
+            for source, rel in incoming:
+                lines.append(f"    ← {source} ← {_norm_rel(rel)}")
+
+        conn.close()
+
+        if not lines:
+            return None
+
+        return "── Graph Context ──\n" + "\n".join(lines)
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------------------
 
 def main() -> None:
     parser = argparse.ArgumentParser(
@@ -1133,6 +1284,10 @@ def main() -> None:
         "--explain", action="store_true",
         help="Show scoring details at each pipeline stage (for debugging)"
     )
+    parser.add_argument(
+        "--no-graph", action="store_true",
+        help="Skip graph context output"
+    )
     args = parser.parse_args()
 
     root = Path(args.root).resolve()
@@ -1153,6 +1308,9 @@ def main() -> None:
         explain=args.explain,
     )
 
+    # Collect result paths for graph context
+    result_paths = [r[1] for r in results]
+
     if args.json:
         output = []
         for result in results:
@@ -1169,7 +1327,15 @@ def main() -> None:
             if c_lines:
                 entry["chunk_lines"] = list(c_lines)
             output.append(entry)
-        print(json.dumps(output, indent=2))
+        # Add graph context to JSON output
+        if not args.no_graph:
+            gc = graph_context(db_path, args.query, result_paths)
+            if gc:
+                print(json.dumps({"results": output, "graph_context": gc}, indent=2))
+            else:
+                print(json.dumps(output, indent=2))
+        else:
+            print(json.dumps(output, indent=2))
     else:
         for result in results:
             score, path, summary = result[0], result[1], result[2]
@@ -1184,6 +1350,12 @@ def main() -> None:
                 print(f"        \u00a7 {c_heading}{line_info}")
             print(f"        {short_summary}")
             print()
+
+        # Graph context at the end
+        if not args.no_graph:
+            gc = graph_context(db_path, args.query, result_paths)
+            if gc:
+                print(gc)
 
 
 if __name__ == "__main__":

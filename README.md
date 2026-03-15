@@ -1,28 +1,47 @@
 # vault-search
 
-Local semantic search for your files. Hybrid retrieval (BM25 + embeddings + RRF) with optional LLM re-ranking. Runs entirely on your machine via [Ollama](https://ollama.ai) — no API cost, no data leaves your network.
+Local semantic search + knowledge graph for your notes. Hybrid retrieval (BM25 + embeddings + RRF) with automatic entity/relationship extraction. Runs entirely on your machine via [Ollama](https://ollama.ai) — no API cost, no data leaves your network.
 
 ## What it does
 
-1. **Index** a directory of markdown, code, and config files into a local SQLite database with embeddings
-2. **Search** using hybrid retrieval that combines semantic similarity with keyword matching
-3. Optionally **re-rank** results with an LLM for significantly better quality on conceptual queries
+1. **Index** your markdown files with embeddings for semantic search
+2. **Extract** a knowledge graph — entities and relationships — from your notes using a local LLM
+3. **Search** with hybrid retrieval that returns ranked files AND shows how concepts connect
+
+```
+$ python3 vault-search.py "reinforcement learning" ~/notes
+
+0.0323  Knowledge/cs--inverse-reinforcement-learning.md
+        Inverse Reinforcement Learning
+
+0.0320  Knowledge/cs--temporal-difference-learning.md
+        Temporal Difference Learning
+
+── Graph Context ──
+  reinforcement learning (concept, 28 connections)
+    → applies_to → reward hacking
+    → builds_on → cybernetics
+    ← markov decision process ← relates_to
+  reinforcement learning from human feedback (technique, 10 connections)
+    → relates_to → reward hacking
+    ← direct preference optimization ← relates_to
+```
 
 ## Quick start
 
 ```bash
 # 1. Install Ollama and pull the models
 ollama pull qwen3-embedding:0.6b   # embeddings (required)
-ollama pull qwen3:8b               # re-ranking + HyDE (optional)
+ollama pull qwen3:8b               # graph extraction + re-ranking (optional)
 
-# 2. Index your files
+# 2. Index your files (embeddings + BM25)
 python3 vault-index.py ~/notes
 
-# 3. Search
-python3 vault-search.py "authentication middleware" ~/notes
-python3 vault-search.py "React hooks" ~/notes --top 10
-python3 vault-search.py "auth patterns" ~/notes --rerank          # LLM re-ranking
-python3 vault-search.py "best practices" ~/notes --expand --rerank  # full pipeline
+# 3. Build the knowledge graph (entity/relationship extraction)
+python3 vault-graph.py index ~/notes
+
+# 4. Search — returns files + graph context automatically
+python3 vault-search.py "attention mechanism" ~/notes
 ```
 
 ## Requirements
@@ -33,18 +52,63 @@ python3 vault-search.py "best practices" ~/notes --expand --rerank  # full pipel
 
 No other dependencies — uses only Python stdlib + Ollama HTTP API.
 
+## The three tools
+
+### vault-index.py — Build the search index
+
+Walks your directory, generates embeddings, builds a BM25 index. Incremental — only re-indexes changed files.
+
+```bash
+python3 vault-index.py ~/notes                # index a directory
+python3 vault-index.py ~/notes --force        # re-index everything
+python3 vault-index.py ~/notes --no-summary   # skip LLM summaries (faster)
+python3 vault-index.py ~/notes --rechunk      # force re-chunk all files
+```
+
+### vault-graph.py — Build the knowledge graph
+
+Extracts entities (concepts, people, theories, techniques) and relationships (builds_on, contradicts, implements, etc.) from your notes using a local LLM. Stores in the same SQLite database as the search index.
+
+```bash
+python3 vault-graph.py index ~/notes                  # extract from all .md files
+python3 vault-graph.py index ~/notes --incremental    # only new/changed files
+python3 vault-graph.py query ~/notes "attention"      # find entity connections
+python3 vault-graph.py query ~/notes "dopamine" --hops 2  # traverse 2 levels
+python3 vault-graph.py stats ~/notes                  # show graph statistics
+python3 vault-graph.py export ~/notes --top 100       # export as JSON
+```
+
+Entity types: `concept`, `technique`, `theory`, `person`, `field`, `system`
+
+Relationship types are normalized to 15 canonical types: `relates_to`, `builds_on`, `contradicts`, `applies_to`, `implements`, `extends`, `part_of`, `uses`, `enables`, `causes`, `explains`, `developed_by`, `type_of`, `complements`
+
+### vault-search.py — Search with graph context
+
+Hybrid search that combines semantic similarity with keyword matching. When graph tables exist in the database, results automatically include a "Graph Context" section showing entity connections.
+
+```bash
+python3 vault-search.py "query" ~/notes                  # hybrid search
+python3 vault-search.py "query" ~/notes --rerank          # LLM re-ranking (better quality)
+python3 vault-search.py "query" ~/notes --expand --rerank # full pipeline (HyDE + rerank)
+python3 vault-search.py "query" ~/notes --mode bm25      # keyword-only (fastest)
+python3 vault-search.py "query" ~/notes --no-graph        # skip graph context
+python3 vault-search.py "query" ~/notes --json            # JSON output
+python3 vault-search.py "query" ~/notes --path Projects/  # filter by path
+```
+
 ## How it works
 
-### Indexing (`vault-index.py`)
+### Search pipeline
 
-- Walks your directory, reads markdown/code/config files
-- Generates embeddings via Ollama (`qwen3-embedding:0.6b` by default)
-- Builds an FTS5 trigram index for keyword search
-- Chunks large files (markdown by `## ` headers, code by 6000-char windows with overlap)
-- Stores everything in SQLite — one DB per indexed directory
-- Incremental: only re-embeds changed files on subsequent runs
-
-### Search (`vault-search.py`)
+```
+Query → [HyDE expand] → Embed → Cosine similarity (file + chunk level)
+                                        ↓
+                              Reciprocal Rank Fusion ← BM25 (FTS5 trigram)
+                                        ↓
+                              [LLM Re-rank top 20]
+                                        ↓
+                              Results + Graph Context
+```
 
 Three search modes:
 
@@ -54,92 +118,46 @@ Three search modes:
 | **semantic**         | Cosine similarity on embeddings only             | Conceptual queries |
 | **bm25**             | FTS5 trigram keyword matching only               | Exact identifiers  |
 
-### Re-ranking (`--rerank`)
+### Knowledge graph
 
-Adds an LLM scoring step after retrieval. The top 20 candidates are scored by the LLM for relevance (0-10 scale), then blended with retrieval scores using position-aware weighting. Uses a sliding-window snippet finder to extract the most relevant ~400 chars from each document.
-
-### HyDE expansion (`--expand`)
-
-Generates a hypothetical document that would answer your query, then embeds that instead of the raw query. Document-to-document similarity is more reliable than question-to-document. Adds ~1s.
-
-### Architecture
-
-```
-Query → [HyDE expand] → Embed → Cosine similarity (file + chunk level)
-                                        ↓
-                              Reciprocal Rank Fusion ← BM25 (FTS5 trigram)
-                                        ↓
-                              [LLM Re-rank top 20]
-                                        ↓
-                                    Results
-```
+The graph extractor sends each note to a local LLM with a structured prompt asking for entities and relationships. Results are stored in two SQLite tables (`entities`, `relations`) in the same database as the search index. At query time, vault-search looks up matching entities and appends their connections to the output.
 
 Key design choices:
 
-- **Dual-granularity scoring**: Both file-level and chunk-level embeddings are scored, with the best chunk score promoting a file's rank. Large files don't get penalized for embedding dilution.
-- **Path-aware keyword bonus**: Query terms that appear in file paths get a 15% score boost with stem-aware matching ("notification" matches "notify").
-- **NumPy batch cosine**: When numpy is available, all cosine similarities are computed via a single matrix multiply — ~9x faster than the pure-Python loop.
-- **Position-aware blend**: Top-5 retrieval results trust the retrieval score more (60/40) to protect exact matches; the rest trust the reranker more (40/60).
+- **Same database**: Graph lives alongside search index — one DB per indexed directory
+- **Incremental**: Only processes new notes, skips already-extracted files
+- **Normalized relations**: LLMs invent creative relationship types. We normalize 500+ variants to 15 canonical types so the graph is consistent
+- **No external services**: No Neo4j, no graph databases — just SQLite
+
+### Search design choices
+
+- **Dual-granularity scoring**: Both file-level and chunk-level embeddings, with best chunk score promoting file rank
+- **Path-aware keyword bonus**: Query terms in file paths get a 15% boost with stem matching
+- **NumPy batch cosine**: Single matrix multiply for all similarities when numpy is available (~9x faster)
+- **Position-aware blend**: Top-5 results trust retrieval more (60/40); the rest trust the reranker more (40/60)
 
 ## Configuration
 
-All settings are configurable via environment variables:
-
-| Variable          | Default                                 | Description                        |
-| ----------------- | --------------------------------------- | ---------------------------------- |
-| `OLLAMA_BASE`     | `http://localhost:11434`                | Ollama API URL                     |
-| `EMBED_MODEL`     | `qwen3-embedding:0.6b`                  | Embedding model                    |
-| `SUMMARY_MODEL`   | `qwen2.5-coder:7b`                      | Summary generation model (indexer) |
-| `EXPAND_MODEL`    | `qwen3:8b`                              | HyDE expansion model               |
-| `RERANK_MODEL`    | `qwen3:8b`                              | Re-ranking model                   |
-| `VAULT_SEARCH_DB` | `~/.local/share/vault-search/<hash>.db` | Database path                      |
-
-Example with different models:
-
-```bash
-EMBED_MODEL=nomic-embed-text RERANK_MODEL=llama3.1:8b python3 vault-search.py "my query" ~/docs
-```
-
-## CLI reference
-
-### vault-index.py
-
-```
-python3 vault-index.py <root>              # index a directory
-python3 vault-index.py <root> --path src/  # index subdirectory only
-python3 vault-index.py <root> --force      # re-index everything
-python3 vault-index.py <root> --no-summary # skip LLM summaries (faster)
-python3 vault-index.py <root> --rechunk    # force re-chunk all files
-python3 vault-index.py <root> --test       # index only 5 files (dry run)
-python3 vault-index.py <root> --db my.db   # custom database path
-```
-
-### vault-search.py
-
-```
-python3 vault-search.py "query" [root]           # search (root defaults to .)
-python3 vault-search.py "query" ~/notes --top 10  # more results
-python3 vault-search.py "query" ~/notes --path Projects/  # path filter
-python3 vault-search.py "query" ~/notes --mode bm25       # keyword-only
-python3 vault-search.py "query" ~/notes --mode semantic    # embeddings-only
-python3 vault-search.py "query" ~/notes --rerank           # LLM re-ranking
-python3 vault-search.py "query" ~/notes --expand           # HyDE expansion
-python3 vault-search.py "query" ~/notes --expand --rerank  # full pipeline
-python3 vault-search.py "query" ~/notes --json             # JSON output
-python3 vault-search.py "query" --db path/to/index.db      # custom DB
-```
+| Variable          | Default                                 | Description            |
+| ----------------- | --------------------------------------- | ---------------------- |
+| `OLLAMA_BASE`     | `http://localhost:11434`                | Ollama API URL         |
+| `EMBED_MODEL`     | `qwen3-embedding:0.6b`                  | Embedding model        |
+| `GRAPH_MODEL`     | `qwen3:8b`                              | Graph extraction model |
+| `EXPAND_MODEL`    | `qwen3:8b`                              | HyDE expansion model   |
+| `RERANK_MODEL`    | `qwen3:8b`                              | Re-ranking model       |
+| `VAULT_SEARCH_DB` | `~/.local/share/vault-search/<hash>.db` | Database path          |
 
 ## Performance
 
-Benchmarked on ~1,800 files / ~3,800 chunks (AMD Ryzen, Vulkan GPU):
+Benchmarked on ~800 notes with knowledge graph (AMD Ryzen, Vulkan GPU):
 
-| Mode                      | Latency |
+| Operation                 | Time    |
 | ------------------------- | ------- |
-| Hybrid (default)          | ~560ms  |
-| With `--rerank`           | ~2-3s   |
-| With `--expand --rerank`  | ~3-4s   |
-| NumPy cosine (1600 files) | ~14ms   |
-| Pure Python cosine        | ~127ms  |
+| Search (hybrid + graph)   | ~4s     |
+| Search (BM25 + graph)     | ~170ms  |
+| Search with `--rerank`    | ~6-8s   |
+| Graph extraction per note | ~30-40s |
+| Incremental re-index      | seconds |
 
 ## File types indexed
 
