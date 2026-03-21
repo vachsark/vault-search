@@ -1308,6 +1308,34 @@ def main() -> None:
         explain=args.explain,
     )
 
+    # Low-confidence detection (skip in --explain mode to avoid noise duplication)
+    # RRF scores (~0.016-0.035) are much smaller than cosine similarity scores (0-1).
+    # Use mode-appropriate thresholds:
+    #   hybrid/bm25: RRF scores, flag if spread < 0.003 (top results indistinguishable)
+    #   semantic:    cosine+keyword scores, flag if top < 0.15 or spread < 0.05
+    if results and not args.explain:
+        top_score = results[0][0]
+        low_conf = False
+        if args.mode == "semantic":
+            if top_score < 0.15:
+                low_conf = True
+            elif len(results) >= 3:
+                top3 = [r[0] for r in results[:3]]
+                spread = max(top3) - min(top3)
+                if spread < 0.05:
+                    low_conf = True
+        else:
+            # hybrid or bm25: use relative spread
+            if len(results) >= 3:
+                top3 = [r[0] for r in results[:3]]
+                spread = max(top3) - min(top3)
+                # If all top results have nearly identical RRF scores, retrieval is uncertain
+                if spread < 0.003:
+                    low_conf = True
+        if low_conf:
+            print("[LOW CONFIDENCE] Top results may not be relevant — "
+                  "consider refining your query", file=sys.stderr)
+
     # Collect result paths for graph context
     result_paths = [r[1] for r in results]
 

@@ -48,7 +48,7 @@ MIN_CHUNK_CHARS = 200
 OVERLAP_CHARS = 300
 
 SKIP_DIRS = {
-    "node_modules", ".git", ".next", "dist", "build",
+    "node_modules", ".git", ".next", "dist", "build", "out",
     ".obsidian", "__pycache__", ".claude", ".trash",
     ".venv", "venv", "env", ".env",
 }
@@ -359,9 +359,16 @@ def content_hash(text: str) -> str:
 def collect_files(root: Path) -> list[Path]:
     files = []
     for dirpath, dirnames, filenames in os.walk(root):
+        cur_dir = Path(dirpath)
+
+        # Respect .vault-search-ignore: if this dir contains the file, skip indexing it
+        if (cur_dir / ".vault-search-ignore").exists():
+            dirnames.clear()  # don't recurse into subdirs
+            continue
+
         dirnames[:] = [d for d in dirnames if not should_skip_dir(d)]
         for fname in filenames:
-            fpath = Path(dirpath) / fname
+            fpath = cur_dir / fname
             if should_index(fpath):
                 files.append(fpath)
     return sorted(files)

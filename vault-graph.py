@@ -105,18 +105,85 @@ RELATION_MAP = {
 }
 
 ENTITY_TYPE_MAP = {
+    # concept — abstract ideas, mechanisms, phenomena, conditions
     "concept": "concept", "process": "concept", "condition": "concept",
     "mechanism": "concept", "pattern": "concept", "phenomenon": "concept",
     "property": "concept", "effect": "concept", "principle": "concept",
+    "constraint": "concept", "goal": "concept", "challenge": "concept",
+    "problem": "concept", "anomaly": "concept", "paradox": "concept",
+    "category": "concept", "context": "concept", "finding": "concept",
+    "strategy": "concept", "rule": "concept", "scenario": "concept",
+    "analogy": "concept", "anti-pattern": "concept", "measurement": "concept",
+    "metric": "concept", "distribution": "concept", "function": "concept",
+    "mathematical function": "concept", "mathematical structure": "concept",
+    "pde": "concept", "interpretation": "concept", "metacognitive error": "concept",
+    "rebuttal": "concept", "natural phenomenon": "concept", "biological_process": "concept",
+    "cognitive_function": "concept",
+    # technique — tools, methods, algorithms, architectures, frameworks, protocols
     "technique": "technique", "tool": "technique", "method": "technique",
     "framework": "technique", "protocol": "technique", "algorithm": "technique",
-    "application": "technique", "architecture": "technique",
+    "application": "technique", "architecture": "technique", "format": "technique",
+    "prompting type": "technique", "hybrid architecture": "technique",
+    "task": "technique", "benchmark": "technique", "study_type": "technique",
+    "study type": "technique", "intervention": "technique", "treatment": "technique",
+    "component": "technique", "resource": "technique", "data": "technique",
+    # theory — theories, models, theorems, laws, paradigms, schools of thought
     "theory": "theory", "theorem": "theory", "conjecture": "theory",
     "law": "theory", "model": "theory", "paradigm": "theory",
-    "person": "person", "people": "person",
+    "school_of_thought": "theory", "school of thought": "theory",
+    "doctrine": "theory", "movement": "theory",
+    # person — individual people
+    "person": "person", "people": "person", "role": "person",
+    # field — academic/professional disciplines
     "field": "field", "domain": "field",
+    "field/technique": "field",
+    # system — platforms, organizations, companies, services, hardware, networks
     "system": "system", "platform": "system", "organization": "system",
     "company": "system", "service": "system", "hardware": "system",
+    "network": "system", "database": "system", "library": "system",
+    "product": "system", "project": "system", "program": "system",
+    "institution": "system", "regulatory body": "system",
+    "political entity": "system", "market": "system",
+    # anatomy — anatomical structures and brain regions
+    "anatomy": "anatomy", "anatomical_structure": "anatomy",
+    "anatomical structure": "anatomy", "anatomical": "anatomy",
+    "brain_region": "anatomy", "brain region": "anatomy",
+    "brain_structure": "anatomy", "neural_pathway": "anatomy",
+    "structure": "anatomy",
+    # biology — biological entities (proteins, genes, molecules, neurotransmitters)
+    "protein": "biology", "gene": "biology", "molecule": "biology",
+    "neurotransmitter": "biology", "neuromodulator": "biology",
+    "hormone": "biology", "receptor": "biology", "drug": "biology",
+    "drug_class": "biology", "substance": "biology", "material": "biology",
+    "species": "biology",
+    # event — historical events, experiments, studies
+    "event": "event", "experiment": "event", "study": "event",
+    "clinical_trial": "event", "case": "event",
+    # publication — books, papers, documents, essays
+    "publication": "publication", "book": "publication", "paper": "publication",
+    "document": "publication", "essay": "publication", "journal": "publication",
+    "guide": "publication", "blog": "publication",
+    # entity (catch-all fallback — normalize to concept)
+    "entity": "concept", "type": "concept", "example": "concept",
+    "research": "concept", "technology": "technique",
+    "storage": "system", "standard": "technique",
+    # award / prize
+    "award": "event", "prize": "event",
+    # location / demographic
+    "location": "concept", "country": "concept", "demographic": "concept",
+    "group": "concept", "language": "concept", "time period": "concept",
+    # design system (normalize to technique)
+    "design system": "technique",
+    # risk / disorder / disease
+    "risk_factor": "concept", "disorder": "concept", "disease": "concept",
+    # particle / physical
+    "particle": "concept",
+    # constitutional provision
+    "constitutional provision": "theory",
+    # act (legal)
+    "act": "theory",
+    # source
+    "source": "publication",
 }
 
 
@@ -162,6 +229,7 @@ def ollama_generate(prompt, model=GRAPH_MODEL):
         "model": model,
         "prompt": prompt,
         "stream": False,
+        "think": False,
         "options": {"num_ctx": 4096, "temperature": 0.1}
     }).encode()
     req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
@@ -454,13 +522,36 @@ def export_graph(conn, top=300, min_connections=2):
     print(json.dumps(result, indent=2, ensure_ascii=False))
 
 
+def normalize_db_types(conn):
+    """Migrate existing entity types in DB to canonical types using ENTITY_TYPE_MAP."""
+    rows = conn.execute("SELECT id, type FROM entities").fetchall()
+    updates = []
+    changed = 0
+    for eid, etype in rows:
+        canonical = ENTITY_TYPE_MAP.get(etype, "concept")
+        if canonical != etype:
+            updates.append((canonical, eid))
+            changed += 1
+    if updates:
+        conn.executemany("UPDATE entities SET type = ? WHERE id = ?", updates)
+        conn.commit()
+    # Report final type distribution
+    type_counts = conn.execute(
+        "SELECT type, COUNT(*) FROM entities GROUP BY type ORDER BY COUNT(*) DESC"
+    ).fetchall()
+    print(f"Normalized {changed} entity type labels.")
+    print(f"Distinct types after normalization: {len(type_counts)}")
+    for t, c in type_counts:
+        print(f"  {c:5d}  {t}")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Knowledge graph extraction for your notes. "
         "Extracts entities and relationships using a local Ollama model."
     )
     parser.add_argument(
-        "command", choices=["index", "query", "stats", "export"],
+        "command", choices=["index", "query", "stats", "export", "normalize-db"],
         help="Command to run"
     )
     parser.add_argument(
@@ -499,6 +590,8 @@ def main():
         show_stats(conn)
     elif args.command == "export":
         export_graph(conn, top=args.top, min_connections=args.min_connections)
+    elif args.command == "normalize-db":
+        normalize_db_types(conn)
 
     conn.close()
 

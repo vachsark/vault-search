@@ -52,7 +52,7 @@ python3 vault-search.py "attention mechanism" ~/notes
 
 No other dependencies — uses only Python stdlib + Ollama HTTP API.
 
-## The three tools
+## The tools
 
 ### vault-index.py — Build the search index
 
@@ -76,9 +76,10 @@ python3 vault-graph.py query ~/notes "attention"      # find entity connections
 python3 vault-graph.py query ~/notes "dopamine" --hops 2  # traverse 2 levels
 python3 vault-graph.py stats ~/notes                  # show graph statistics
 python3 vault-graph.py export ~/notes --top 100       # export as JSON
+python3 vault-graph.py normalize-db ~/notes           # migrate entity types to canonical labels
 ```
 
-Entity types: `concept`, `technique`, `theory`, `person`, `field`, `system`
+Entity types: `concept`, `technique`, `theory`, `person`, `field`, `system`, `anatomy`, `biology`, `event`, `publication`
 
 Relationship types are normalized to 15 canonical types: `relates_to`, `builds_on`, `contradicts`, `applies_to`, `implements`, `extends`, `part_of`, `uses`, `enables`, `causes`, `explains`, `developed_by`, `type_of`, `complements`
 
@@ -95,6 +96,42 @@ python3 vault-search.py "query" ~/notes --no-graph        # skip graph context
 python3 vault-search.py "query" ~/notes --json            # JSON output
 python3 vault-search.py "query" ~/notes --path Projects/  # filter by path
 ```
+
+### verify-citations.py — Check URLs in markdown files
+
+Verifies that URLs in your notes are alive. Catches dead links (404), redirects, and hallucinated references (arxiv IDs with wrong format, placeholder DOIs, etc.). Runs concurrently — no external dependencies, stdlib only.
+
+```bash
+python3 verify-citations.py note.md                    # check one file
+python3 verify-citations.py note.md --fix              # print suggested replacements
+python3 verify-citations.py --dir Knowledge/           # scan a directory
+python3 verify-citations.py --dir Knowledge/ --json    # JSON output
+python3 verify-citations.py --dir Knowledge/ --issues-only  # only show files with problems
+```
+
+### knowledge-path.py — Find paths between concepts
+
+Finds the shortest conceptual path between two ideas using the knowledge graph. Like "six degrees of separation" for your notes.
+
+```bash
+python3 knowledge-path.py "prospect theory" "transformer architecture"
+python3 knowledge-path.py "dopamine" "market microstructure" --max-hops 8
+python3 knowledge-path.py "ADHD" "reinforcement learning" --all   # show multiple paths
+python3 knowledge-path.py "attention" "memory" --stats            # show graph size first
+```
+
+### synthesis-suggest.py — Find cross-domain synthesis candidates
+
+Surfaces concept pairs with high neighbor overlap that span different disciplines — the most promising cross-domain connections not yet bridged by a synthesis note.
+
+```bash
+python3 synthesis-suggest.py ~/notes                    # top 10 candidates
+python3 synthesis-suggest.py ~/notes --top 20
+python3 synthesis-suggest.py ~/notes --min-jaccard 0.25 # stricter threshold
+python3 synthesis-suggest.py ~/notes --json             # machine-readable output
+```
+
+Requires discipline-prefixed filenames (`discipline--topic.md` naming convention). If your notes use a different convention, set `DISCIPLINE_SEPARATOR` in the script.
 
 ## How it works
 
@@ -135,6 +172,7 @@ Key design choices:
 - **Path-aware keyword bonus**: Query terms in file paths get a 15% boost with stem matching
 - **NumPy batch cosine**: Single matrix multiply for all similarities when numpy is available (~9x faster)
 - **Position-aware blend**: Top-5 results trust retrieval more (60/40); the rest trust the reranker more (40/60)
+- **Mode-aware low-confidence detection**: RRF scores (hybrid/bm25) use a spread threshold of 0.003; semantic mode uses absolute score < 0.15 — prevents false low-confidence warnings when scores are normally small
 
 ## Configuration
 
