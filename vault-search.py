@@ -23,6 +23,7 @@ Usage:
     python3 vault-search.py "attention" --intent "machine learning"  # intent steering
     python3 vault-search.py 'lex:"reciprocal rank" vec:search fusion' # typed sub-queries
     python3 vault-search.py "auth patterns" --explain        # scoring details
+    python3 vault-search.py "how does auth handle token expiry" --iterate  # two-pass retrieval
 
 Typed sub-queries:
     lex:"term"     BM25 keyword search for that term
@@ -79,8 +80,8 @@ except ImportError:
 
 OLLAMA_BASE = os.environ.get("OLLAMA_BASE", "http://localhost:11434")
 EMBED_MODEL = os.environ.get("EMBED_MODEL", "qwen3-embedding:0.6b")
-EXPAND_MODEL = os.environ.get("EXPAND_MODEL", "qwen3:8b")
-RERANK_MODEL = os.environ.get("RERANK_MODEL", "qwen3:8b")
+EXPAND_MODEL = os.environ.get("EXPAND_MODEL", "qwen3.5:9b")  # qwen3:8b deprecated 2026-03-20
+RERANK_MODEL = os.environ.get("RERANK_MODEL", "qwen3.5:9b")  # qwen3:8b deprecated 2026-03-20
 
 RERANK_TOP_N = 20   # Candidates to re-rank from retrieval stage
 RERANK_BLEND_K = 5  # Position-aware blending: top-k results trust retrieval more
@@ -647,6 +648,234 @@ def parse_typed_subqueries(query: str) -> dict[str, list[str]]:
         result["plain"].append(plain)
 
     return result
+
+
+# Heading terms that are generic meta-section labels — not useful as expansion terms.
+# These appear across many notes as section headers but carry no topical signal.
+_EXPANSION_HEADING_STOPLIST = {
+    # Generic note structure headers
+    "assessment", "growth", "session", "overview", "summary", "background",
+    "context", "introduction", "conclusion", "discussion", "analysis",
+    "notes", "references", "sources", "connections", "links", "related",
+    "examples", "applications", "implications", "limitations", "challenges",
+    "next steps", "action items", "todo", "status", "updates", "history",
+    "definition", "definitions", "description", "details", "info",
+    "key points", "key takeaways", "takeaways", "highlights", "tags",
+    "metadata", "properties", "frontmatter", "resources", "further reading",
+    "see also", "appendix", "table of contents", "toc", "index",
+    # Generic vault/note headers
+    "synthesis", "reflection", "observations", "findings", "results",
+    "implementation", "usage", "setup", "configuration", "installation",
+    "troubleshooting", "faq", "questions", "answers", "review", "feedback",
+    "project", "projects", "tasks", "goals", "objectives", "milestones",
+    "timeline", "schedule", "plan", "planning", "roadmap",
+    # Single-word generic terms that leak from headings
+    "section", "chapter", "part", "phase", "stage", "step", "steps",
+    "approach", "method", "methods", "technique", "techniques", "framework",
+    "theory", "practice", "principles", "concepts", "ideas",
+}
+
+
+def _extract_expansion_terms(
+    results: list[tuple],
+    conn: sqlite3.Connection,
+    original_query: str,
+    top_n: int = 4,
+) -> list[str]:
+    """
+    Extract key terms from top search results for iterative query expansion.
+
+    Pulls: Obsidian [[wikilinks]], YAML front-matter tags, section headings,
+    and backtick identifiers not already in the original query.
+    Returns up to 10 expansion terms.
+
+    The stoplist filters generic heading words ("Summary", "Overview", etc.)
+    that appear everywhere and add no topical signal to the expanded query.
+    """
+    q_words = set(re.findall(r'\w+', original_query.lower()))
+    terms: list[str] = []
+    seen: set[str] = set()
+
+    paths = [r[1] for r in results[:top_n]]
+    if not paths:
+        return terms
+
+    paths_in = ", ".join("?" * len(paths))
+    try:
+        rows = conn.execute(
+            f"SELECT path, content, summary FROM files WHERE path IN ({paths_in})",
+            paths,
+        ).fetchall()
+    except Exception:
+        return terms
+
+    for _, content, summary in rows:
+        text = content or summary or ""
+        if not text:
+            continue
+
+        # Obsidian [[wikilinks]] — rich concept vocabulary in markdown vaults
+        for m in re.finditer(r'\[\[([^\]|#]{2,60})(?:[|#][^\]]{0,60})?\]\]', text):
+            link = m.group(1).strip()
+            link_lower = link.lower().replace("-", " ")
+            words = set(link_lower.split())
+            if words - q_words and link_lower not in seen:
+                terms.append(link)
+                seen.add(link_lower)
+
+        # YAML front-matter tags: `tags: [foo, bar]` or `- tag`
+        fm_match = re.match(r'^---\n(.*?)\n---', text, re.DOTALL)
+        if fm_match:
+            fm = fm_match.group(1)
+            for m in re.finditer(r'[\-\s]([a-z][a-z0-9_-]{2,30})', fm):
+                tag = m.group(1).replace("-", " ")
+                if tag not in seen and tag not in q_words:
+                    terms.append(tag)
+                    seen.add(tag)
+
+        # Section headings (## Title) — structural signal, filtered by stoplist
+        for m in re.finditer(r'^#{1,3}\s+(.{3,60})$', text, re.MULTILINE):
+            heading = m.group(1).strip()
+            heading_lower = heading.lower()
+            if heading_lower in _EXPANSION_HEADING_STOPLIST:
+                continue
+            heading_words = set(re.findall(r'\w+', heading_lower))
+            if heading_words and heading_words.issubset(_EXPANSION_HEADING_STOPLIST):
+                continue
+            if len(heading_words - q_words) >= 2 and heading_lower not in seen:
+                terms.append(heading)
+                seen.add(heading_lower)
+
+        # Backtick identifiers (code, function names, config keys)
+        for m in re.finditer(r'`([a-zA-Z_][a-zA-Z0-9_:.-]{2,40})`', text):
+            ident = m.group(1)
+            ident_lower = ident.lower()
+            if ident_lower not in seen and ident_lower not in q_words:
+                terms.append(ident)
+                seen.add(ident_lower)
+
+    return terms[:10]
+
+
+def iterative_search(
+    query: str,
+    db_path: Path,
+    top_k: int = 5,
+    path_filter: str | None = None,
+    mode: str = "hybrid",
+    expand: bool = False,
+    rerank: bool = False,
+    intent: str | None = None,
+    explain: bool = False,
+) -> list[tuple]:
+    """
+    Two-pass iterative retrieval.
+
+    Pass 1: standard search with the original query — finds the obvious matches.
+    Extract: key terms from pass-1 results (wikilinks, headings, identifiers).
+    Pass 2: search again with query + extracted terms — finds cross-referenced
+            sections that use different vocabulary than the original query.
+    Merge: RRF-fuse both result sets, deduplicate, return top-k.
+
+    Use --iterate on the CLI to enable this mode.
+
+    Example: "how does the autoresearch system handle failed experiments"
+      Pass 1 → finds autoresearch.md, goals.md
+      Extract: [[output-judge]], [[quality-triage]], "3-attempt limit"
+      Pass 2 → also finds auto-implement.md, heartbeat/schedule.md
+      Result: the full failure-handling pipeline, not just the entry point.
+    """
+    if explain:
+        print("[ITERATE] Pass 1: standard search", file=sys.stderr)
+
+    # Multi-hop queries need more candidates — use at least 10 in iterate mode
+    effective_top_k = max(top_k, 10)
+
+    # Pass 1 — standard retrieval
+    conn = sqlite3.connect(str(db_path))
+    pass1 = search(
+        query, db_path, top_k=effective_top_k * 2,
+        path_filter=path_filter, mode=mode,
+        expand=expand, rerank=False,
+        intent=intent, explain=False,
+    )
+
+    if not pass1:
+        conn.close()
+        if rerank:
+            return search(query, db_path, top_k=top_k, path_filter=path_filter,
+                          mode=mode, expand=expand, rerank=rerank, intent=intent,
+                          explain=explain)
+        return pass1
+
+    # Extract expansion terms from pass-1 results
+    expansion_terms = _extract_expansion_terms(pass1, conn, query)
+    conn.close()
+
+    if explain:
+        print(f"[ITERATE] Extracted {len(expansion_terms)} expansion terms: "
+              f"{expansion_terms}", file=sys.stderr)
+
+    if not expansion_terms:
+        if rerank:
+            return search(query, db_path, top_k=top_k, path_filter=path_filter,
+                          mode=mode, expand=expand, rerank=True, intent=intent,
+                          explain=explain)
+        return pass1[:top_k]
+
+    # Build expanded query
+    expanded_query = query + " " + " ".join(expansion_terms)
+    if explain:
+        print(f"[ITERATE] Expanded query: {expanded_query[:120]}...", file=sys.stderr)
+        print("[ITERATE] Pass 2: expanded search", file=sys.stderr)
+
+    # Pass 2 — retrieval with expanded query (no HyDE to avoid double-expansion)
+    pass2 = search(
+        expanded_query, db_path, top_k=effective_top_k * 2,
+        path_filter=path_filter, mode=mode,
+        expand=False,
+        rerank=False,
+        intent=intent, explain=False,
+    )
+
+    if explain:
+        pass1_paths = {r[1] for r in pass1}
+        new_in_pass2 = [r for r in pass2 if r[1] not in pass1_paths]
+        print(f"[ITERATE] Pass 2 found {len(new_in_pass2)} new paths: "
+              f"{[r[1] for r in new_in_pass2[:5]]}", file=sys.stderr)
+
+    # RRF-fuse pass 1 and pass 2
+    all_docs: dict[str, dict] = {}
+    for rank, item in enumerate(pass1):
+        path = item[1]
+        all_docs.setdefault(path, {"item": item, "rrf": 0.0})
+        all_docs[path]["rrf"] += 1.0 / (60 + rank + 1)
+
+    for rank, item in enumerate(pass2):
+        path = item[1]
+        if path not in all_docs:
+            all_docs[path] = {"item": item, "rrf": 0.0}
+        all_docs[path]["rrf"] += 1.0 / (60 + rank + 1)
+
+    fused = sorted(all_docs.values(), key=lambda x: x["rrf"], reverse=True)
+    merged = [(v["rrf"], v["item"][1], v["item"][2],
+               v["item"][3] if len(v["item"]) > 3 else None,
+               v["item"][4] if len(v["item"]) > 4 else None)
+              for v in fused]
+
+    if rerank:
+        if explain:
+            print("[ITERATE] Re-ranking merged results...", file=sys.stderr)
+        conn2 = sqlite3.connect(str(db_path))
+        merged = rerank_results(query, merged, conn2, intent=intent)[:top_k]
+        conn2.close()
+    else:
+        merged = merged[:top_k]
+
+    if explain:
+        print(f"[ITERATE] Final: {len(merged)} results after merge", file=sys.stderr)
+
+    return merged
 
 
 def search(
@@ -1288,6 +1517,13 @@ def main() -> None:
         "--no-graph", action="store_true",
         help="Skip graph context output"
     )
+    parser.add_argument(
+        "--iterate", action="store_true",
+        help="Two-pass iterative retrieval: extract key terms from pass-1 results "
+             "and run a second search with an expanded query. Improves recall for "
+             "multi-concept queries and cross-references (adds ~50%% more time). "
+             "Example: vault-search.py 'how does auth handle token expiry' --iterate"
+    )
     args = parser.parse_args()
 
     root = Path(args.root).resolve()
@@ -1296,17 +1532,30 @@ def main() -> None:
     else:
         db_path = db_path_for_root(root)
 
-    results = search(
-        args.query,
-        db_path=db_path,
-        top_k=args.top,
-        path_filter=args.path,
-        mode=args.mode,
-        expand=args.expand,
-        rerank=args.rerank,
-        intent=args.intent,
-        explain=args.explain,
-    )
+    if args.iterate:
+        results = iterative_search(
+            args.query,
+            db_path=db_path,
+            top_k=args.top,
+            path_filter=args.path,
+            mode=args.mode,
+            expand=args.expand,
+            rerank=args.rerank,
+            intent=args.intent,
+            explain=args.explain,
+        )
+    else:
+        results = search(
+            args.query,
+            db_path=db_path,
+            top_k=args.top,
+            path_filter=args.path,
+            mode=args.mode,
+            expand=args.expand,
+            rerank=args.rerank,
+            intent=args.intent,
+            explain=args.explain,
+        )
 
     # Low-confidence detection (skip in --explain mode to avoid noise duplication)
     # RRF scores (~0.016-0.035) are much smaller than cosine similarity scores (0-1).
