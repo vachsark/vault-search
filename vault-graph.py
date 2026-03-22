@@ -16,7 +16,7 @@ Usage:
 
 Environment:
     OLLAMA_BASE    Ollama URL (default: http://localhost:11434)
-    GRAPH_MODEL    Model for extraction (default: qwen3:8b)
+    GRAPH_MODEL    Model for extraction (default: qwen3.5:9b)
 """
 
 import argparse
@@ -30,7 +30,7 @@ import urllib.request
 from pathlib import Path
 
 OLLAMA_BASE = os.environ.get("OLLAMA_BASE", "http://localhost:11434")
-GRAPH_MODEL = os.environ.get("GRAPH_MODEL", "qwen3:8b")
+GRAPH_MODEL = os.environ.get("GRAPH_MODEL", "qwen3.5:9b")  # qwen3:8b deprecated 2026-03-20
 
 
 def db_path_for_root(root: str) -> str:
@@ -102,6 +102,30 @@ RELATION_MAP = {
     "integrates_with": "complements", "combines_with": "complements", "synergizes_with": "complements",
     "bridges": "complements", "connects_to": "complements", "linked_to": "complements",
     "parallel_to": "complements", "equivalent_to": "complements",
+    # relates_to — catch-all structural/associative (also the canonical default)
+    "relates_to": "relates_to", "related_to": "relates_to", "relates": "relates_to",
+    "relate_to": "relates_to", "associated_with": "relates_to", "associated": "relates_to",
+    "maps_to": "relates_to", "maps": "relates_to", "connects": "relates_to",
+    "corresponds_to": "relates_to", "is_related_to": "relates_to",
+    # uses (additional variants)
+    "involves": "uses", "involves_use_of": "uses", "utilizes_the_concept_of": "uses",
+    "monitors": "uses", "monitors_via": "uses", "tracks": "uses", "observes": "uses",
+    "accesses": "uses", "leverages": "uses",
+    # part_of (additional variants)
+    "has": "part_of", "has_property": "part_of", "has_feature": "part_of",
+    "has_attribute": "part_of", "has_function": "part_of",
+    # explains (additional variants)
+    "evaluates": "explains", "assesses": "explains", "studies": "explains",
+    "analyzes": "explains", "investigates": "explains", "tests": "explains",
+    # enables (additional variants)
+    "addresses": "enables", "solves": "enables", "handles": "enables",
+    "mitigates": "enables", "optimizes": "enables", "improves": "enables",
+    "enhances": "enables", "strengthens": "enables", "increases": "enables",
+    "reduces": "enables", "decreases": "enables",
+    # developed_by (additional variants)
+    "develops": "developed_by", "introduces": "developed_by", "presented_by": "developed_by",
+    "discovered_by": "developed_by", "invented_by": "developed_by",
+    "formulated_by": "developed_by", "proposed": "developed_by",
 }
 
 ENTITY_TYPE_MAP = {
@@ -193,6 +217,23 @@ def normalize_relation(r):
 
 def normalize_entity_type(t):
     return ENTITY_TYPE_MAP.get(t, "concept")
+
+
+def normalize_entity_name(name: str) -> str:
+    """
+    Normalize entity name to prevent fragmentation.
+    Converts 'decision-making', 'decision_making' → 'decision making'.
+    Preserves meaningful hyphens: 'b-tree', '5-ht1a', 't-cell'.
+    """
+    name = name.lower()
+    name = name.replace('_', ' ')
+    prev = None
+    while prev != name:
+        prev = name
+        name = re.sub(r'([a-z]{3,})-([a-z]{3,})', r'\1 \2', name)
+        name = re.sub(r'([a-z0-9]{2,})-([a-z]{3,})', r'\1 \2', name)
+    name = re.sub(r'\s+', ' ', name).strip()
+    return name
 
 
 def init_tables(conn):
@@ -325,10 +366,10 @@ def index_notes(conn, root_dir, incremental=False):
 
         for ent in entities:
             if isinstance(ent, str):
-                ent_name = ent.strip().lower()
+                ent_name = normalize_entity_name(ent.strip())
                 ent_type = "concept"
             else:
-                ent_name = ent.get("name", "").strip().lower()
+                ent_name = normalize_entity_name(ent.get("name", "").strip())
                 ent_type = ent.get("type", "concept").strip().lower()
             if ent_name and len(ent_name) > 1:
                 try:
@@ -343,8 +384,8 @@ def index_notes(conn, root_dir, incremental=False):
         for rel in relations:
             if isinstance(rel, str):
                 continue  # skip malformed relation
-            src = rel.get("source", "").strip().lower()
-            tgt = rel.get("target", "").strip().lower()
+            src = normalize_entity_name(rel.get("source", "").strip())
+            tgt = normalize_entity_name(rel.get("target", "").strip())
             relation = rel.get("relation", "relates_to").strip().lower()
             if src and tgt and src != tgt:
                 try:
@@ -523,7 +564,8 @@ def export_graph(conn, top=300, min_connections=2):
 
 
 def normalize_db_types(conn):
-    """Migrate existing entity types in DB to canonical types using ENTITY_TYPE_MAP."""
+    """Migrate existing entity types and relation types in DB to canonical values."""
+    # 1. Normalize entity types
     rows = conn.execute("SELECT id, type FROM entities").fetchall()
     updates = []
     changed = 0
@@ -535,14 +577,54 @@ def normalize_db_types(conn):
     if updates:
         conn.executemany("UPDATE entities SET type = ? WHERE id = ?", updates)
         conn.commit()
-    # Report final type distribution
+    # Report final entity type distribution
     type_counts = conn.execute(
         "SELECT type, COUNT(*) FROM entities GROUP BY type ORDER BY COUNT(*) DESC"
     ).fetchall()
     print(f"Normalized {changed} entity type labels.")
-    print(f"Distinct types after normalization: {len(type_counts)}")
+    print(f"Distinct entity types after normalization: {len(type_counts)}")
     for t, c in type_counts:
         print(f"  {c:5d}  {t}")
+
+    # 2. Normalize relation types — handle UNIQUE constraint by deleting conflicts
+    rel_rows = conn.execute(
+        "SELECT id, source_entity, relation, target_entity, source_file FROM relations"
+    ).fetchall()
+    rel_changed = 0
+    rel_merged = 0
+    rel_unchanged_types = {}
+    for rid, src, rel, tgt, sf in rel_rows:
+        canonical = RELATION_MAP.get(rel, None)
+        if canonical is None:
+            rel_unchanged_types[rel] = rel_unchanged_types.get(rel, 0) + 1
+            canonical = "relates_to"
+        if canonical != rel:
+            # Check if a canonical row already exists — if so, delete this one
+            existing = conn.execute(
+                "SELECT id FROM relations WHERE source_entity=? AND relation=? AND target_entity=? AND source_file=?",
+                (src, canonical, tgt, sf)
+            ).fetchone()
+            if existing:
+                conn.execute("DELETE FROM relations WHERE id=?", (rid,))
+                rel_merged += 1
+            else:
+                conn.execute(
+                    "UPDATE relations SET relation=? WHERE id=?", (canonical, rid)
+                )
+                rel_changed += 1
+    conn.commit()
+    rel_counts = conn.execute(
+        "SELECT relation, COUNT(*) FROM relations GROUP BY relation ORDER BY COUNT(*) DESC"
+    ).fetchall()
+    print(f"\nNormalized {rel_changed} relation type labels, merged {rel_merged} duplicates.")
+    print(f"Distinct relation types after normalization: {len(rel_counts)}")
+    for r, c in rel_counts:
+        print(f"  {c:5d}  {r}")
+    if rel_unchanged_types:
+        top_unknown = sorted(rel_unchanged_types.items(), key=lambda x: -x[1])[:10]
+        print(f"\nTop unknown relations mapped to 'relates_to' ({len(rel_unchanged_types)} types):")
+        for r, c in top_unknown:
+            print(f"  {c:4d}  '{r}'")
 
 
 def main():

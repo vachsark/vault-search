@@ -32,7 +32,7 @@ $ python3 vault-search.py "reinforcement learning" ~/notes
 ```bash
 # 1. Install Ollama and pull the models
 ollama pull qwen3-embedding:0.6b   # embeddings (required)
-ollama pull qwen3:8b               # graph extraction + re-ranking (optional)
+ollama pull qwen3.5:9b             # graph extraction + re-ranking (optional)
 
 # 2. Index your files (embeddings + BM25)
 python3 vault-index.py ~/notes
@@ -181,9 +181,9 @@ Key design choices:
 | ------------------------ | --------------------------------------- | ----------------------------------------------------------- |
 | `OLLAMA_BASE`            | `http://localhost:11434`                | Ollama API URL                                              |
 | `EMBED_MODEL`            | `qwen3-embedding:0.6b`                  | Embedding model                                             |
-| `GRAPH_MODEL`            | `qwen3:8b`                              | Graph extraction model                                      |
-| `EXPAND_MODEL`           | `qwen3:8b`                              | HyDE expansion model                                        |
-| `RERANK_MODEL`           | `qwen3:8b`                              | Re-ranking model                                            |
+| `GRAPH_MODEL`            | `qwen3.5:9b`                            | Graph extraction model                                      |
+| `EXPAND_MODEL`           | `qwen3.5:9b`                            | HyDE expansion model                                        |
+| `RERANK_MODEL`           | `qwen3.5:9b`                            | Re-ranking model                                            |
 | `VAULT_SEARCH_DB`        | `~/.local/share/vault-search/<hash>.db` | Database path                                               |
 | `VAULT_SEARCH_CACHE_DIR` | `~/.cache/vault-search/embed-cache`     | Disk embedding cache directory (use `--no-cache` to bypass) |
 

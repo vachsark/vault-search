@@ -320,7 +320,7 @@ def ollama_summarize(content: str, filepath: str) -> str:
         "model": SUMMARY_MODEL,
         "prompt": prompt,
         "stream": False,
-        "options": {"temperature": 0.2, "num_predict": 150},
+        "options": {"temperature": 0.2, "num_predict": 150, "num_ctx": 2048},
     }).encode()
     req = urllib.request.Request(
         f"{OLLAMA_BASE}/api/generate",
