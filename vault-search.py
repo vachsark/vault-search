@@ -24,6 +24,7 @@ Usage:
     python3 vault-search.py 'lex:"reciprocal rank" vec:search fusion' # typed sub-queries
     python3 vault-search.py "auth patterns" --explain        # scoring details
     python3 vault-search.py "how does auth handle token expiry" --iterate  # two-pass retrieval
+    python3 vault-search.py "attention" --no-cache            # bypass disk embedding cache
 
 Typed sub-queries:
     lex:"term"     BM25 keyword search for that term
@@ -37,6 +38,8 @@ Environment variables:
     EXPAND_MODEL      HyDE expansion model (default: qwen3:8b)
     RERANK_MODEL      Re-ranking model (default: qwen3:8b)
     VAULT_SEARCH_DB   Database path override (default: auto per root dir)
+    VAULT_SEARCH_CACHE_DIR  Disk embedding cache directory
+                            (default: ~/.cache/vault-search/embed-cache)
 """
 
 import argparse
@@ -241,10 +244,58 @@ def keyword_score(query: str, path: str) -> float:
 _embed_cache: dict[str, list[float]] = {}
 _EMBED_CACHE_MAX = 64
 
+# Disk embedding cache — persists query embeddings across runs.
+# Keyed by sha256(model:text) — survives restarts, eliminates ~4s cold-embed cost
+# on repeated queries. Disable with --no-cache (e.g. after switching embed models).
+EMBED_DISK_CACHE_DIR = Path(
+    os.environ.get(
+        "VAULT_SEARCH_CACHE_DIR",
+        str(Path.home() / ".cache" / "vault-search" / "embed-cache"),
+    )
+)
+_disk_cache_enabled: bool = True  # set to False via --no-cache
+
+
+def _disk_cache_path(text: str) -> Path:
+    """Return the cache file path for a given text + current model."""
+    key = hashlib.sha256(f"{EMBED_MODEL}:{text}".encode()).hexdigest()
+    return EMBED_DISK_CACHE_DIR / f"{key}.json"
+
+
+def _load_disk_cache(text: str) -> list[float] | None:
+    """Return cached embedding vector, or None on miss."""
+    if not _disk_cache_enabled:
+        return None
+    path = _disk_cache_path(text)
+    try:
+        if path.exists():
+            return json.loads(path.read_text())
+    except Exception:
+        pass
+    return None
+
+
+def _save_disk_cache(text: str, emb: list[float]) -> None:
+    """Write embedding vector to disk cache. Failure is non-fatal."""
+    if not _disk_cache_enabled:
+        return
+    try:
+        EMBED_DISK_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        _disk_cache_path(text).write_text(json.dumps(emb))
+    except Exception:
+        pass
+
 
 def ollama_embed(text: str) -> list[float]:
+    # 1. In-memory cache (process-lifetime, instant)
     if text in _embed_cache:
         return _embed_cache[text]
+    # 2. Disk cache (cross-run, ~1ms)
+    cached = _load_disk_cache(text)
+    if cached is not None:
+        _embed_cache[text] = cached
+        return cached
+    # 3. Ollama API call (~4-6s cold)
     payload = json.dumps({
         "model": EMBED_MODEL,
         "prompt": text,
@@ -260,6 +311,7 @@ def ollama_embed(text: str) -> list[float]:
     if len(_embed_cache) >= _EMBED_CACHE_MAX:
         _embed_cache.pop(next(iter(_embed_cache)))
     _embed_cache[text] = emb
+    _save_disk_cache(text, emb)
     return emb
 
 
@@ -284,7 +336,7 @@ def hyde_expand(query: str, intent: str | None = None) -> str:
         "prompt": prompt,
         "stream": False,
         "think": False,
-        "options": {"temperature": 0.3, "num_predict": 120},
+        "options": {"temperature": 0.3, "num_predict": 120, "num_ctx": 8192},
     }).encode()
     req = urllib.request.Request(
         f"{OLLAMA_BASE}/api/generate",
@@ -801,11 +853,12 @@ def iterative_search(
     )
 
     if not pass1:
-        conn.close()
         if rerank:
+            conn.close()
             return search(query, db_path, top_k=top_k, path_filter=path_filter,
                           mode=mode, expand=expand, rerank=rerank, intent=intent,
                           explain=explain)
+        conn.close()
         return pass1
 
     # Extract expansion terms from pass-1 results
@@ -844,7 +897,7 @@ def iterative_search(
         print(f"[ITERATE] Pass 2 found {len(new_in_pass2)} new paths: "
               f"{[r[1] for r in new_in_pass2[:5]]}", file=sys.stderr)
 
-    # RRF-fuse pass 1 and pass 2
+    # RRF-fuse pass 1 and pass 2 result lists
     all_docs: dict[str, dict] = {}
     for rank, item in enumerate(pass1):
         path = item[1]
@@ -1155,20 +1208,49 @@ def search(
              f"top={semantic_results[0][0]:.4f} ({(time.time()-t0)*1000:.0f}ms)")
 
     # Chunk-level search — find the best matching chunk per file
+    #
+    # Performance: limit chunk search to top-N candidate files from semantic results.
+    # Large repos can have 500k+ chunks — loading all is slow (~5s) and wasteful.
+    # Restricting to top-200 semantic candidates covers everything that could appear
+    # in the final top_k output while reducing chunk I/O by ~96%.
+    # Chunks outside the top semantic candidates can never win the final ranking.
+    CHUNK_CANDIDATE_LIMIT = 200
     if has_chunks:
-        if path_filter:
-            chunk_rows = conn.execute(
-                "SELECT file_path, chunk_index, heading, start_line, end_line, "
-                "embedding, embedding_norm "
-                "FROM chunks WHERE file_path LIKE ? ESCAPE '\\'",
-                (f"{escape_like(path_filter)}%",)
-            ).fetchall()
+        candidate_paths = [r[1] for r in semantic_results[:CHUNK_CANDIDATE_LIMIT]]
+        if candidate_paths:
+            if path_filter:
+                # Intersect candidate paths with path_filter to restrict scope
+                placeholders = ",".join("?" * len(candidate_paths))
+                chunk_rows = conn.execute(
+                    f"SELECT file_path, chunk_index, heading, start_line, end_line, "
+                    f"embedding, embedding_norm "
+                    f"FROM chunks WHERE file_path LIKE ? ESCAPE '\\' "
+                    f"AND file_path IN ({placeholders})",
+                    (f"{escape_like(path_filter)}%", *candidate_paths)
+                ).fetchall()
+            else:
+                placeholders = ",".join("?" * len(candidate_paths))
+                chunk_rows = conn.execute(
+                    f"SELECT file_path, chunk_index, heading, start_line, end_line, "
+                    f"embedding, embedding_norm "
+                    f"FROM chunks WHERE file_path IN ({placeholders})",
+                    candidate_paths
+                ).fetchall()
         else:
-            chunk_rows = conn.execute(
-                "SELECT file_path, chunk_index, heading, start_line, end_line, "
-                "embedding, embedding_norm "
-                "FROM chunks"
-            ).fetchall()
+            # Fallback: no semantic candidates — use path_filter or load all
+            if path_filter:
+                chunk_rows = conn.execute(
+                    "SELECT file_path, chunk_index, heading, start_line, end_line, "
+                    "embedding, embedding_norm "
+                    "FROM chunks WHERE file_path LIKE ? ESCAPE '\\'",
+                    (f"{escape_like(path_filter)}%",)
+                ).fetchall()
+            else:
+                chunk_rows = conn.execute(
+                    "SELECT file_path, chunk_index, heading, start_line, end_line, "
+                    "embedding, embedding_norm "
+                    "FROM chunks"
+                ).fetchall()
 
         if chunk_rows:
             # Track best chunk per file: (score, heading, start_line, end_line)
@@ -1524,7 +1606,18 @@ def main() -> None:
              "multi-concept queries and cross-references (adds ~50%% more time). "
              "Example: vault-search.py 'how does auth handle token expiry' --iterate"
     )
+    parser.add_argument(
+        "--no-cache", action="store_true",
+        help="Bypass disk embedding cache — always call Ollama. "
+             "Use this after switching embedding models or when embeddings "
+             "may be stale."
+    )
     args = parser.parse_args()
+
+    # Apply --no-cache before any embed calls
+    if args.no_cache:
+        global _disk_cache_enabled
+        _disk_cache_enabled = False
 
     root = Path(args.root).resolve()
     if args.db:

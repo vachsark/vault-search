@@ -95,6 +95,7 @@ python3 vault-search.py "query" ~/notes --mode bm25      # keyword-only (fastest
 python3 vault-search.py "query" ~/notes --no-graph        # skip graph context
 python3 vault-search.py "query" ~/notes --json            # JSON output
 python3 vault-search.py "query" ~/notes --path Projects/  # filter by path
+python3 vault-search.py "query" ~/notes --no-cache        # bypass disk embedding cache
 ```
 
 ### verify-citations.py — Check URLs in markdown files
@@ -176,26 +177,30 @@ Key design choices:
 
 ## Configuration
 
-| Variable          | Default                                 | Description            |
-| ----------------- | --------------------------------------- | ---------------------- |
-| `OLLAMA_BASE`     | `http://localhost:11434`                | Ollama API URL         |
-| `EMBED_MODEL`     | `qwen3-embedding:0.6b`                  | Embedding model        |
-| `GRAPH_MODEL`     | `qwen3:8b`                              | Graph extraction model |
-| `EXPAND_MODEL`    | `qwen3:8b`                              | HyDE expansion model   |
-| `RERANK_MODEL`    | `qwen3:8b`                              | Re-ranking model       |
-| `VAULT_SEARCH_DB` | `~/.local/share/vault-search/<hash>.db` | Database path          |
+| Variable                 | Default                                 | Description                                                 |
+| ------------------------ | --------------------------------------- | ----------------------------------------------------------- |
+| `OLLAMA_BASE`            | `http://localhost:11434`                | Ollama API URL                                              |
+| `EMBED_MODEL`            | `qwen3-embedding:0.6b`                  | Embedding model                                             |
+| `GRAPH_MODEL`            | `qwen3:8b`                              | Graph extraction model                                      |
+| `EXPAND_MODEL`           | `qwen3:8b`                              | HyDE expansion model                                        |
+| `RERANK_MODEL`           | `qwen3:8b`                              | Re-ranking model                                            |
+| `VAULT_SEARCH_DB`        | `~/.local/share/vault-search/<hash>.db` | Database path                                               |
+| `VAULT_SEARCH_CACHE_DIR` | `~/.cache/vault-search/embed-cache`     | Disk embedding cache directory (use `--no-cache` to bypass) |
 
 ## Performance
 
 Benchmarked on ~800 notes with knowledge graph (AMD Ryzen, Vulkan GPU):
 
-| Operation                 | Time    |
-| ------------------------- | ------- |
-| Search (hybrid + graph)   | ~4s     |
-| Search (BM25 + graph)     | ~170ms  |
-| Search with `--rerank`    | ~6-8s   |
-| Graph extraction per note | ~30-40s |
-| Incremental re-index      | seconds |
+| Operation                           | Time    |
+| ----------------------------------- | ------- |
+| Search (hybrid + graph), cold embed | ~4s     |
+| Search (hybrid + graph), cached     | ~170ms  |
+| Search (BM25 + graph)               | ~170ms  |
+| Search with `--rerank`              | ~6-8s   |
+| Graph extraction per note           | ~30-40s |
+| Incremental re-index                | seconds |
+
+The disk embedding cache (enabled by default) skips the ~4s Ollama embed call on repeated queries by persisting vectors to `~/.cache/vault-search/embed-cache/`. Use `--no-cache` after switching embedding models.
 
 ## File types indexed
 
