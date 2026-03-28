@@ -134,6 +134,48 @@ python3 synthesis-suggest.py ~/notes --json             # machine-readable outpu
 
 Requires discipline-prefixed filenames (`discipline--topic.md` naming convention). If your notes use a different convention, set `DISCIPLINE_SEPARATOR` in the script.
 
+### causal-trace.py — Trace causal chains between concepts
+
+Walks the knowledge graph to find causal or mechanistic chains between two concepts. Unlike knowledge-path (shortest path), this follows directional relationships like `causes`, `enables`, `builds_on`.
+
+```bash
+python3 causal-trace.py "cortisol" "decision making"
+python3 causal-trace.py "dopamine" "addiction" --allow-reverse  # also follow reverse edges
+python3 causal-trace.py "inflation" "unemployment" --max-depth 6
+```
+
+### concept-to-code.py — Bridge knowledge to code
+
+Finds where a knowledge concept maps to actual code implementations in your repository. Searches both the knowledge graph (concept → related notes) and the codebase (grep for concept terms in source files).
+
+```bash
+python3 concept-to-code.py "spaced repetition"     # find code implementing this concept
+python3 concept-to-code.py "attention mechanism"    # find implementations
+```
+
+### vault-ask.py — Natural language Q&A over your vault
+
+Ask a question in plain English, get an answer grounded in your actual notes. Uses vault-search to find relevant context, then synthesizes an answer.
+
+```bash
+python3 vault-ask.py "What does the vault know about scheduling optimization?"
+python3 vault-ask.py "How does the learning engine work?"
+```
+
+### leiden-communities.py — Community detection in the knowledge graph
+
+Detects clusters of densely connected concepts using the Leiden algorithm. Useful for understanding the structure of your knowledge base and finding gaps between communities.
+
+```bash
+python3 leiden-communities.py                       # detect all communities
+python3 leiden-communities.py --stats-only          # just show statistics
+python3 leiden-communities.py --query "dopamine"    # which community is this concept in?
+python3 leiden-communities.py --sweep               # parameter sweep for resolution
+python3 leiden-communities.py --export              # export community assignments
+```
+
+Requires `leidenalg` and `igraph`: `pip install leidenalg python-igraph`
+
 ## How it works
 
 ### Search pipeline
@@ -189,7 +231,7 @@ Key design choices:
 
 ## Performance
 
-Benchmarked on ~800 notes with knowledge graph (AMD Ryzen, Vulkan GPU):
+Benchmarked on ~6,000 notes with 40K+ graph relations (AMD Ryzen 5 7600X, RX 9070 XT):
 
 | Operation                           | Time    |
 | ----------------------------------- | ------- |

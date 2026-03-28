@@ -23,8 +23,6 @@ Usage:
     python3 vault-search.py "attention" --intent "machine learning"  # intent steering
     python3 vault-search.py 'lex:"reciprocal rank" vec:search fusion' # typed sub-queries
     python3 vault-search.py "auth patterns" --explain        # scoring details
-    python3 vault-search.py "how does auth handle token expiry" --iterate  # two-pass retrieval
-    python3 vault-search.py "attention" --no-cache            # bypass disk embedding cache
 
 Typed sub-queries:
     lex:"term"     BM25 keyword search for that term
@@ -35,11 +33,9 @@ Typed sub-queries:
 Environment variables:
     OLLAMA_BASE       Ollama API URL (default: http://localhost:11434)
     EMBED_MODEL       Embedding model (default: qwen3-embedding:0.6b)
-    EXPAND_MODEL      HyDE expansion model (default: qwen3:8b)
-    RERANK_MODEL      Re-ranking model (default: qwen3:8b)
+    EXPAND_MODEL      HyDE expansion model (default: qwen3.5:9b)
+    RERANK_MODEL      Re-ranking model (default: qwen3.5:9b)
     VAULT_SEARCH_DB   Database path override (default: auto per root dir)
-    VAULT_SEARCH_CACHE_DIR  Disk embedding cache directory
-                            (default: ~/.cache/vault-search/embed-cache)
 """
 
 import argparse
@@ -83,8 +79,8 @@ except ImportError:
 
 OLLAMA_BASE = os.environ.get("OLLAMA_BASE", "http://localhost:11434")
 EMBED_MODEL = os.environ.get("EMBED_MODEL", "qwen3-embedding:0.6b")
-EXPAND_MODEL = os.environ.get("EXPAND_MODEL", "qwen3.5:9b")  # qwen3:8b deprecated 2026-03-20
-RERANK_MODEL = os.environ.get("RERANK_MODEL", "qwen3.5:9b")  # qwen3:8b deprecated 2026-03-20
+EXPAND_MODEL = os.environ.get("EXPAND_MODEL", "qwen3.5:9b")  # updated from qwen3:8b (deprecated 2026-03-20)
+RERANK_MODEL = os.environ.get("RERANK_MODEL", "qwen3.5:9b")  # updated from qwen3:8b (deprecated 2026-03-20)
 
 RERANK_TOP_N = 20   # Candidates to re-rank from retrieval stage
 RERANK_BLEND_K = 5  # Position-aware blending: top-k results trust retrieval more
@@ -141,16 +137,30 @@ def norm(a: list[float]) -> float:
 
 
 def unpack_embedding(blob: bytes) -> list[float]:
-    """Unpack a binary blob back to a list of floats.
+    """Unpack a binary embedding blob back to a list of floats.
 
-    Auto-detects float32 vs float64 format based on blob size.
+    Auto-detects format by blob size relative to known dimension count (1024):
+      - 2048 bytes = float16 (2 bytes/dim)
+      - 4096 bytes = float32 (4 bytes/dim)
+      - 8192 bytes = float64 (8 bytes/dim)
+    Falls back to float32 for unknown sizes.
     """
-    if len(blob) % 8 == 0 and len(blob) // 8 == 1024:
-        n = len(blob) // 8
-        return list(struct.unpack(f'{n}d', blob))
-    else:
-        n = len(blob) // 4
-        return list(struct.unpack(f'{n}f', blob))
+    n_f16 = len(blob) // 2
+    n_f64 = len(blob) // 8
+
+    # float64 detection (legacy): blob is exactly 1024 doubles
+    if len(blob) % 8 == 0 and n_f64 == 1024:
+        return list(struct.unpack(f'{n_f64}d', blob))
+    # float16 detection: blob is exactly 1024 halves (2048 bytes)
+    if len(blob) == 2048 and n_f16 == 1024:
+        if HAS_NUMPY:
+            return np.frombuffer(blob, dtype=np.float16).astype(np.float32).tolist()
+        else:
+            # Pure-Python: struct has no half-float, so we skip
+            pass
+    # float32 (current default or fallback)
+    n_f32 = len(blob) // 4
+    return list(struct.unpack(f'{n_f32}f', blob))
 
 
 def cosine_similarity(a: list[float], b: list[float]) -> float:
@@ -183,6 +193,8 @@ def vectorized_search(
     for i, (path, blob, enorm, summary) in enumerate(rows):
         if len(blob) == dims * 8:
             emb_matrix[i] = np.frombuffer(blob, dtype=np.float64).astype(np.float32)
+        elif len(blob) == dims * 2:
+            emb_matrix[i] = np.frombuffer(blob, dtype=np.float16).astype(np.float32)
         else:
             emb_matrix[i] = np.frombuffer(blob, dtype=np.float32)
         norms_arr[i] = enorm or 0.0
@@ -244,15 +256,9 @@ def keyword_score(query: str, path: str) -> float:
 _embed_cache: dict[str, list[float]] = {}
 _EMBED_CACHE_MAX = 64
 
-# Disk embedding cache — persists query embeddings across runs.
-# Keyed by sha256(model:text) — survives restarts, eliminates ~4s cold-embed cost
-# on repeated queries. Disable with --no-cache (e.g. after switching embed models).
-EMBED_DISK_CACHE_DIR = Path(
-    os.environ.get(
-        "VAULT_SEARCH_CACHE_DIR",
-        str(Path.home() / ".cache" / "vault-search" / "embed-cache"),
-    )
-)
+# Disk embedding cache — persists across runs; keyed by sha256(model:text)
+_VAULT_ROOT = Path(__file__).resolve().parent.parent
+EMBED_DISK_CACHE_DIR = _VAULT_ROOT / "_data" / "embed-cache"
 _disk_cache_enabled: bool = True  # set to False via --no-cache
 
 
@@ -276,14 +282,14 @@ def _load_disk_cache(text: str) -> list[float] | None:
 
 
 def _save_disk_cache(text: str, emb: list[float]) -> None:
-    """Write embedding vector to disk cache. Failure is non-fatal."""
+    """Write embedding vector to disk cache."""
     if not _disk_cache_enabled:
         return
     try:
         EMBED_DISK_CACHE_DIR.mkdir(parents=True, exist_ok=True)
         _disk_cache_path(text).write_text(json.dumps(emb))
     except Exception:
-        pass
+        pass  # Cache write failure is non-fatal
 
 
 def ollama_embed(text: str) -> list[float]:
@@ -295,7 +301,7 @@ def ollama_embed(text: str) -> list[float]:
     if cached is not None:
         _embed_cache[text] = cached
         return cached
-    # 3. Ollama API call (~4-6s cold)
+    # 3. Ollama API call (~5500ms cold)
     payload = json.dumps({
         "model": EMBED_MODEL,
         "prompt": text,
@@ -715,7 +721,7 @@ _EXPANSION_HEADING_STOPLIST = {
     "key points", "key takeaways", "takeaways", "highlights", "tags",
     "metadata", "properties", "frontmatter", "resources", "further reading",
     "see also", "appendix", "table of contents", "toc", "index",
-    # Generic vault/note headers
+    # Vault-specific generic headers
     "synthesis", "reflection", "observations", "findings", "results",
     "implementation", "usage", "setup", "configuration", "installation",
     "troubleshooting", "faq", "questions", "answers", "review", "feedback",
@@ -728,7 +734,7 @@ _EXPANSION_HEADING_STOPLIST = {
 }
 
 
-def _extract_expansion_terms(
+def _extract_vault_expansion_terms(
     results: list[tuple],
     conn: sqlite3.Connection,
     original_query: str,
@@ -737,12 +743,9 @@ def _extract_expansion_terms(
     """
     Extract key terms from top search results for iterative query expansion.
 
-    Pulls: Obsidian [[wikilinks]], YAML front-matter tags, section headings,
-    and backtick identifiers not already in the original query.
+    Pulls: Obsidian [[wikilinks]], YAML front-matter tags, capitalized proper
+    nouns, and high-frequency n-grams not already in the original query.
     Returns up to 10 expansion terms.
-
-    The stoplist filters generic heading words ("Summary", "Overview", etc.)
-    that appear everywhere and add no topical signal to the expanded query.
     """
     q_words = set(re.findall(r'\w+', original_query.lower()))
     terms: list[str] = []
@@ -766,7 +769,7 @@ def _extract_expansion_terms(
         if not text:
             continue
 
-        # Obsidian [[wikilinks]] — rich concept vocabulary in markdown vaults
+        # Obsidian [[wikilinks]] — the vault's native concept vocabulary
         for m in re.finditer(r'\[\[([^\]|#]{2,60})(?:[|#][^\]]{0,60})?\]\]', text):
             link = m.group(1).strip()
             link_lower = link.lower().replace("-", " ")
@@ -785,20 +788,24 @@ def _extract_expansion_terms(
                     terms.append(tag)
                     seen.add(tag)
 
-        # Section headings (## Title) — structural signal, filtered by stoplist
+        # Heading lines (## Section Name) — highest-signal structure markers
         for m in re.finditer(r'^#{1,3}\s+(.{3,60})$', text, re.MULTILINE):
             heading = m.group(1).strip()
             heading_lower = heading.lower()
+            # Skip generic meta-section headers that add no topical signal
             if heading_lower in _EXPANSION_HEADING_STOPLIST:
                 continue
+            # Also skip if every word in the heading is in the stoplist
             heading_words = set(re.findall(r'\w+', heading_lower))
             if heading_words and heading_words.issubset(_EXPANSION_HEADING_STOPLIST):
                 continue
-            if len(heading_words - q_words) >= 2 and heading_lower not in seen:
+            words = heading_words
+            # Only add if heading introduces new vocabulary
+            if len(words - q_words) >= 2 and heading_lower not in seen:
                 terms.append(heading)
                 seen.add(heading_lower)
 
-        # Backtick identifiers (code, function names, config keys)
+        # Backtick identifiers (code, function names, keys)
         for m in re.finditer(r'`([a-zA-Z_][a-zA-Z0-9_:.-]{2,40})`', text):
             ident = m.group(1)
             ident_lower = ident.lower()
@@ -821,15 +828,13 @@ def iterative_search(
     explain: bool = False,
 ) -> list[tuple]:
     """
-    Two-pass iterative retrieval.
+    Two-pass iterative retrieval (MSA-inspired).
 
     Pass 1: standard search with the original query — finds the obvious matches.
     Extract: key terms from pass-1 results (wikilinks, headings, identifiers).
     Pass 2: search again with query + extracted terms — finds cross-referenced
             sections that use different vocabulary than the original query.
     Merge: RRF-fuse both result sets, deduplicate, return top-k.
-
-    Use --iterate on the CLI to enable this mode.
 
     Example: "how does the autoresearch system handle failed experiments"
       Pass 1 → finds autoresearch.md, goals.md
@@ -841,6 +846,7 @@ def iterative_search(
         print("[ITERATE] Pass 1: standard search", file=sys.stderr)
 
     # Multi-hop queries need more candidates — use at least 10 in iterate mode
+    # so the term extractor has enough cross-references to work with.
     effective_top_k = max(top_k, 10)
 
     # Pass 1 — standard retrieval
@@ -848,21 +854,20 @@ def iterative_search(
     pass1 = search(
         query, db_path, top_k=effective_top_k * 2,
         path_filter=path_filter, mode=mode,
-        expand=expand, rerank=False,
-        intent=intent, explain=False,
+        expand=expand, rerank=False,  # skip rerank on pass 1 — do it after merge
+        intent=intent, explain=False,  # suppress nested explain
     )
 
     if not pass1:
         if rerank:
-            conn.close()
-            return search(query, db_path, top_k=top_k, path_filter=path_filter,
-                          mode=mode, expand=expand, rerank=rerank, intent=intent,
-                          explain=explain)
+            pass1 = search(query, db_path, top_k=top_k, path_filter=path_filter,
+                           mode=mode, expand=expand, rerank=rerank, intent=intent,
+                           explain=explain)
         conn.close()
         return pass1
 
     # Extract expansion terms from pass-1 results
-    expansion_terms = _extract_expansion_terms(pass1, conn, query)
+    expansion_terms = _extract_vault_expansion_terms(pass1, conn, query)
     conn.close()
 
     if explain:
@@ -870,6 +875,7 @@ def iterative_search(
               f"{expansion_terms}", file=sys.stderr)
 
     if not expansion_terms:
+        # Nothing to expand — fall back to single-pass (with rerank if requested)
         if rerank:
             return search(query, db_path, top_k=top_k, path_filter=path_filter,
                           mode=mode, expand=expand, rerank=True, intent=intent,
@@ -882,11 +888,11 @@ def iterative_search(
         print(f"[ITERATE] Expanded query: {expanded_query[:120]}...", file=sys.stderr)
         print("[ITERATE] Pass 2: expanded search", file=sys.stderr)
 
-    # Pass 2 — retrieval with expanded query (no HyDE to avoid double-expansion)
+    # Pass 2 — retrieval with expanded query (no HyDE expansion to avoid double-expansion)
     pass2 = search(
         expanded_query, db_path, top_k=effective_top_k * 2,
         path_filter=path_filter, mode=mode,
-        expand=False,
+        expand=False,  # don't HyDE-expand an already-expanded query
         rerank=False,
         intent=intent, explain=False,
     )
@@ -898,6 +904,10 @@ def iterative_search(
               f"{[r[1] for r in new_in_pass2[:5]]}", file=sys.stderr)
 
     # RRF-fuse pass 1 and pass 2 result lists
+    # Build path→best-tuple maps from each pass
+    p1_map: dict[str, tuple] = {r[1]: r for r in pass1}
+    p2_map: dict[str, tuple] = {r[1]: r for r in pass2}
+
     all_docs: dict[str, dict] = {}
     for rank, item in enumerate(pass1):
         path = item[1]
@@ -916,6 +926,7 @@ def iterative_search(
                v["item"][4] if len(v["item"]) > 4 else None)
               for v in fused]
 
+    # Optional rerank on merged candidates
     if rerank:
         if explain:
             print("[ITERATE] Re-ranking merged results...", file=sys.stderr)
@@ -1208,24 +1219,26 @@ def search(
              f"top={semantic_results[0][0]:.4f} ({(time.time()-t0)*1000:.0f}ms)")
 
     # Chunk-level search — find the best matching chunk per file
-    #
-    # Performance: limit chunk search to top-N candidate files from semantic results.
-    # Large repos can have 500k+ chunks — loading all is slow (~5s) and wasteful.
-    # Restricting to top-200 semantic candidates covers everything that could appear
-    # in the final top_k output while reducing chunk I/O by ~96%.
-    # Chunks outside the top semantic candidates can never win the final ranking.
+    # Performance: limit chunk search to top-N candidate files from semantic + BM25 results.
+    # At 500k+ chunks, loading all takes ~5s. Restricting to top 200 candidate files
+    # covers all results that could possibly surface in the final top_k output while
+    # reducing chunk I/O by ~96%.
     CHUNK_CANDIDATE_LIMIT = 200
     if has_chunks:
+        # Always pre-filter chunks to top semantic candidates.
+        # With 577k+ chunks for Projects/ and 7.6k for Knowledge/, loading ALL chunks
+        # for a path_filter is expensive (~5s) and redundant — chunks outside the top
+        # semantic candidates can never appear in the final top_k output.
+        # Fix 2026-03-22: apply the candidate pre-filter for path_filter case too.
         candidate_paths = [r[1] for r in semantic_results[:CHUNK_CANDIDATE_LIMIT]]
         if candidate_paths:
             if path_filter:
-                # Intersect candidate paths with path_filter to restrict scope
+                # Intersect candidates with path_filter to restrict scope
                 placeholders = ",".join("?" * len(candidate_paths))
                 chunk_rows = conn.execute(
                     f"SELECT file_path, chunk_index, heading, start_line, end_line, "
                     f"embedding, embedding_norm "
-                    f"FROM chunks WHERE file_path LIKE ? ESCAPE '\\' "
-                    f"AND file_path IN ({placeholders})",
+                    f"FROM chunks WHERE file_path LIKE ? ESCAPE '\\' AND file_path IN ({placeholders})",
                     (f"{escape_like(path_filter)}%", *candidate_paths)
                 ).fetchall()
             else:
@@ -1237,7 +1250,7 @@ def search(
                     candidate_paths
                 ).fetchall()
         else:
-            # Fallback: no semantic candidates — use path_filter or load all
+            # Fallback: no semantic candidates — use path_filter alone or load all
             if path_filter:
                 chunk_rows = conn.execute(
                     "SELECT file_path, chunk_index, heading, start_line, end_line, "
@@ -1269,6 +1282,8 @@ def search(
                 for i, (fp, ci, heading, sline, eline, blob, cnorm) in enumerate(chunk_rows):
                     if len(blob) == dims * 8:
                         chunk_matrix[i] = np.frombuffer(blob, dtype=np.float64).astype(np.float32)
+                    elif len(blob) == dims * 2:
+                        chunk_matrix[i] = np.frombuffer(blob, dtype=np.float16).astype(np.float32)
                     else:
                         chunk_matrix[i] = np.frombuffer(blob, dtype=np.float32)
                     chunk_norms[i] = cnorm or 0.0
@@ -1374,6 +1389,11 @@ def search(
     )
     _explain(f"RRF fusion → {len(fused)} candidates")
 
+    # Community boost: nudge results sharing Leiden communities with query entities
+    t0 = time.time()
+    fused = community_boost(fused, conn, query)
+    _explain(f"Community boost ({(time.time()-t0)*1000:.0f}ms)")
+
     if rerank:
         print("Re-ranking with LLM...", file=sys.stderr)
         t0 = time.time()
@@ -1392,6 +1412,94 @@ def search(
 
     conn.close()
     return fused
+
+
+# ---------------------------------------------------------------------------
+# Community boost — Leiden community co-membership scoring
+# ---------------------------------------------------------------------------
+
+def community_boost(
+    results: list[tuple],
+    conn: "sqlite3.Connection",
+    query: str,
+    boost_weight: float = 0.005,
+) -> list[tuple]:
+    """Boost results whose source files share Leiden communities with query entities.
+
+    Returns re-sorted results with community co-membership bonus applied.
+    The boost is small (default 0.005 per community overlap) to nudge
+    rather than dominate the ranking.
+    """
+    try:
+        tables = {r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()}
+        if "communities" not in tables or "entities" not in tables:
+            return results
+
+        # Find entities matching the query
+        query_lower = query.lower().strip()
+        query_words = [w for w in query_lower.split() if len(w) > 3]
+
+        matched = set()
+        # Exact phrase match
+        for r in conn.execute(
+            "SELECT DISTINCT name FROM entities WHERE lower(name) LIKE ?",
+            (f"%{query_lower}%",)
+        ).fetchall():
+            matched.add(r[0])
+        # Word matches
+        for word in query_words:
+            for r in conn.execute(
+                "SELECT DISTINCT name FROM entities WHERE lower(name) LIKE ?",
+                (f"%{word}%",)
+            ).fetchall():
+                ename = r[0].lower()
+                if word in ename.split() or ename.startswith(word) or ename.endswith(word):
+                    matched.add(r[0])
+
+        if not matched:
+            return results
+
+        # Get communities for matched entities
+        query_communities = set()
+        for ent in matched:
+            row = conn.execute(
+                "SELECT community_id FROM communities WHERE entity = ?", (ent,)
+            ).fetchone()
+            if row:
+                query_communities.add(row[0])
+
+        if not query_communities:
+            return results
+
+        # For each result file, check if its entities share communities
+        boosted = []
+        for item in results:
+            score, path = item[0], item[1]
+            fname = os.path.basename(path)
+
+            # Find entities from this file
+            file_entities = conn.execute(
+                "SELECT DISTINCT name FROM entities WHERE source_file = ?",
+                (fname,)
+            ).fetchall()
+
+            overlap = 0
+            for (ent,) in file_entities:
+                row = conn.execute(
+                    "SELECT community_id FROM communities WHERE entity = ?", (ent,)
+                ).fetchone()
+                if row and row[0] in query_communities:
+                    overlap += 1
+
+            new_score = score + overlap * boost_weight
+            boosted.append((new_score, *item[1:]))
+
+        boosted.sort(key=lambda x: x[0], reverse=True)
+        return boosted
+    except Exception:
+        return results
 
 
 # ---------------------------------------------------------------------------
@@ -1531,12 +1639,66 @@ def graph_context(db_path: Path, query: str, result_paths: list[str]) -> str | N
             for source, rel in incoming:
                 lines.append(f"    ← {source} ← {_norm_rel(rel)}")
 
+        # --- Community context (Leiden) ---
+        community_lines = []
+        if "communities" in tables:
+            # Find communities for matched entities
+            query_communities: dict[int, list[str]] = {}  # community_id -> [entity names]
+            for ent in top_entities:
+                row = conn.execute(
+                    "SELECT community_id, community_size FROM communities WHERE entity = ?",
+                    (ent,)
+                ).fetchone()
+                if row:
+                    cid, csize = row
+                    query_communities.setdefault(cid, []).append(ent)
+
+            if query_communities:
+                community_lines.append("")
+                community_lines.append("── Community Context (Leiden) ──")
+                for cid, ents in sorted(query_communities.items(),
+                                         key=lambda x: len(x[1]), reverse=True)[:3]:
+                    # Get community meta for label
+                    meta_row = conn.execute(
+                        "SELECT top_entities, density FROM community_meta WHERE community_id = ?",
+                        (cid,)
+                    ).fetchone()
+                    label = ""
+                    if meta_row and meta_row[0]:
+                        try:
+                            top_ents = json.loads(meta_row[0])[:5]
+                        except (json.JSONDecodeError, TypeError):
+                            top_ents = [e.strip() for e in meta_row[0].split(",")[:5]]
+                        label = f" [{', '.join(top_ents)}]"
+
+                    community_lines.append(f"  Community {cid}{label}")
+                    community_lines.append(f"    Members in query: {', '.join(ents)}")
+
+                    # Find sibling entities in same community (not already shown)
+                    shown = set(top_entities) | set(ents)
+                    siblings = conn.execute(
+                        "SELECT entity FROM communities WHERE community_id = ? "
+                        "AND entity NOT IN ({}) ORDER BY RANDOM() LIMIT 5".format(
+                            ",".join("?" * len(shown))
+                        ),
+                        (cid, *shown)
+                    ).fetchall()
+                    if siblings:
+                        sib_names = [s[0] for s in siblings]
+                        community_lines.append(f"    Related: {', '.join(sib_names)}")
+
         conn.close()
 
-        if not lines:
+        if not lines and not community_lines:
             return None
 
-        return "── Graph Context ──\n" + "\n".join(lines)
+        output_parts = []
+        if lines:
+            output_parts.append("── Graph Context ──\n" + "\n".join(lines))
+        if community_lines:
+            output_parts.append("\n".join(community_lines))
+
+        return "\n".join(output_parts) if output_parts else None
     except Exception:
         return None
 
@@ -1551,9 +1713,10 @@ def main() -> None:
         "query", type=str,
         help="Search query"
     )
+    _vault_root = str(Path(__file__).resolve().parent.parent)
     parser.add_argument(
-        "root", nargs="?", type=str, default=".",
-        help="Root directory that was indexed (default: current directory)"
+        "root", nargs="?", type=str, default=_vault_root,
+        help="Root directory that was indexed (default: vault root)"
     )
     parser.add_argument(
         "--top", type=int, default=5,
@@ -1600,21 +1763,19 @@ def main() -> None:
         help="Skip graph context output"
     )
     parser.add_argument(
-        "--iterate", action="store_true",
-        help="Two-pass iterative retrieval: extract key terms from pass-1 results "
-             "and run a second search with an expanded query. Improves recall for "
-             "multi-concept queries and cross-references (adds ~50%% more time). "
-             "Example: vault-search.py 'how does auth handle token expiry' --iterate"
+        "--no-cache", action="store_true",
+        help="Bypass disk embedding cache — always call Ollama (for fresh embeddings "
+             "or after model changes)"
     )
     parser.add_argument(
-        "--no-cache", action="store_true",
-        help="Bypass disk embedding cache — always call Ollama. "
-             "Use this after switching embedding models or when embeddings "
-             "may be stale."
+        "--iterate", action="store_true",
+        help="Two-pass iterative retrieval: extract key terms from pass-1 results "
+             "and run a second search with expanded query. Improves recall for "
+             "multi-concept queries and cross-references (adds ~50%% more time)."
     )
     args = parser.parse_args()
 
-    # Apply --no-cache before any embed calls
+    # Apply --no-cache flag to module-level global before any embed calls
     if args.no_cache:
         global _disk_cache_enabled
         _disk_cache_enabled = False

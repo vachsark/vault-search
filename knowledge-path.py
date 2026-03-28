@@ -18,8 +18,14 @@ from collections import defaultdict, deque
 from pathlib import Path
 
 
-def build_graph(db_path: str) -> dict[str, set[str]]:
-    """Build an undirected adjacency graph from the relations table."""
+def build_graph(db_path: str, prune_leaves: bool = True) -> dict[str, set[str]]:
+    """Build an undirected adjacency graph from the relations table.
+
+    By default, prunes degree-1 entities (mentions, not concepts).
+    Per practice--first-principles-audit-knowledge-engine: 58% of entities
+    are degree-1 leaf nodes that inflate average path length from the <6-hop
+    target to 9.42 hops. Removing them focuses the graph on conceptual hubs.
+    """
     conn = sqlite3.connect(db_path)
     graph: dict[str, set[str]] = defaultdict(set)
 
@@ -30,12 +36,28 @@ def build_graph(db_path: str) -> dict[str, set[str]]:
             graph[t].add(s)
 
     conn.close()
-    return graph
+
+    if prune_leaves:
+        # Remove degree-1 entities — they are mentions, not structural concepts.
+        # A single-pass prune is sufficient; iterative k-core would be too aggressive.
+        leaves = {n for n, neighbors in graph.items() if len(neighbors) < 2}
+        for node in leaves:
+            for neighbor in list(graph[node]):
+                graph[neighbor].discard(node)
+            del graph[node]
+
+    return dict(graph)
 
 
 def find_path(graph: dict[str, set[str]], start: str, end: str,
               max_depth: int = 8) -> list[str] | None:
-    """BFS shortest path between two entities."""
+    """BFS shortest path between two entities.
+
+    Neighbors are explored in descending degree order so that, when multiple
+    shortest paths exist, the one passing through the highest-degree (hub)
+    nodes is returned. Hub nodes are semantic connectors in the knowledge
+    graph — preferring them produces more meaningful paths.
+    """
     start, end = start.lower().strip(), end.lower().strip()
 
     # Exact match first
@@ -65,7 +87,11 @@ def find_path(graph: dict[str, set[str]], start: str, end: str,
         if len(path) > max_depth:
             continue
 
-        for neighbor in graph.get(node, set()):
+        # Sort by degree descending — hub-biased BFS prefers paths through
+        # high-connectivity concepts (knowledge hubs) over peripheral nodes.
+        neighbors = sorted(graph.get(node, set()),
+                           key=lambda n: len(graph.get(n, ())), reverse=True)
+        for neighbor in neighbors:
             if neighbor == end:
                 return path + [neighbor]
             if neighbor not in visited:
@@ -103,7 +129,9 @@ def find_all_paths(graph: dict[str, set[str]], start: str, end: str,
         if len(path) > max_depth:
             continue
 
-        for neighbor in graph.get(node, set()):
+        neighbors = sorted(graph.get(node, set()),
+                           key=lambda n: len(graph.get(n, ())), reverse=True)
+        for neighbor in neighbors:
             new_path = path + [neighbor]
 
             if neighbor == end_lower:
@@ -131,6 +159,9 @@ def main():
                         help="Show multiple paths")
     parser.add_argument("--stats", action="store_true",
                         help="Show graph statistics")
+    parser.add_argument("--include-leaves", action="store_true",
+                        help="Include degree-1 entities (leaf nodes / mentions). "
+                             "Default: pruned to degree>=2 for shorter, more meaningful paths")
 
     args = parser.parse_args()
 
@@ -145,11 +176,12 @@ def main():
         print("No vault-search database found", file=sys.stderr)
         sys.exit(1)
 
-    graph = build_graph(dbs[0])
+    graph = build_graph(dbs[0], prune_leaves=not args.include_leaves)
 
     if args.stats:
-        print(f"Graph: {len(graph)} entities, "
-              f"{sum(len(v) for v in graph.values()) // 2} edges")
+        n_edges = sum(len(v) for v in graph.values()) // 2
+        leaf_note = "" if args.include_leaves else " (degree>=2 concepts only)"
+        print(f"Graph: {len(graph)} entities{leaf_note}, {n_edges} edges")
         print()
 
     if args.all:

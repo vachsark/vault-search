@@ -30,7 +30,7 @@ import urllib.request
 from pathlib import Path
 
 OLLAMA_BASE = os.environ.get("OLLAMA_BASE", "http://localhost:11434")
-GRAPH_MODEL = os.environ.get("GRAPH_MODEL", "qwen3.5:9b")  # qwen3:8b deprecated 2026-03-20
+GRAPH_MODEL = os.environ.get("GRAPH_MODEL", "qwen3.5:9b")  # updated from qwen3:8b (deprecated 2026-03-20)
 
 
 def db_path_for_root(root: str) -> str:
@@ -224,7 +224,10 @@ def normalize_entity_name(name: str) -> str:
     Normalize entity name to prevent fragmentation.
     Converts 'decision-making', 'decision_making' → 'decision making'.
     Preserves meaningful hyphens: 'b-tree', '5-ht1a', 't-cell'.
+
+    Mirrors the same function in inject-causal-edges.py.
     """
+    import re
     name = name.lower()
     name = name.replace('_', ' ')
     prev = None
@@ -469,6 +472,281 @@ def query_entity(conn, query, hops=1):
         print()
 
 
+def fuzzy_entity_lookup(conn, query: str, max_candidates: int = 8) -> list[str]:
+    """
+    Fuzzy entity lookup using LIKE substring matching, then prefix matching.
+    Returns a ranked list of candidate entity names from the graph.
+
+    Priority order:
+    1. Exact match
+    2. Substring match (LIKE %query%)
+    3. Word-boundary prefix match (space-separated tokens)
+
+    This is the entity normalization layer for the NL→graph-query pipeline (H-010).
+    Mitigates the plurality/synonym problem (e.g. "neural network" vs "neural networks").
+    """
+    query_norm = normalize_entity_name(query)
+
+    candidates = []
+    seen = set()
+
+    # 1. Exact match
+    rows = conn.execute(
+        "SELECT DISTINCT name FROM entities WHERE name = ? LIMIT ?",
+        (query_norm, max_candidates)
+    ).fetchall()
+    for row in rows:
+        if row[0] not in seen:
+            candidates.append(row[0])
+            seen.add(row[0])
+
+    # 2. Substring match
+    if len(candidates) < max_candidates:
+        rows = conn.execute(
+            "SELECT DISTINCT name FROM entities WHERE name LIKE ? LIMIT ?",
+            (f"%{query_norm}%", max_candidates - len(candidates))
+        ).fetchall()
+        for row in rows:
+            if row[0] not in seen:
+                candidates.append(row[0])
+                seen.add(row[0])
+
+    # 3. Per-word token match (catch plurals and compound variants)
+    if len(candidates) < max_candidates:
+        tokens = [t for t in query_norm.split() if len(t) > 3]
+        for token in tokens[:3]:
+            rows = conn.execute(
+                "SELECT DISTINCT name FROM entities WHERE name LIKE ? LIMIT ?",
+                (f"%{token}%", max_candidates - len(candidates))
+            ).fetchall()
+            for row in rows:
+                if row[0] not in seen:
+                    candidates.append(row[0])
+                    seen.add(row[0])
+            if len(candidates) >= max_candidates:
+                break
+
+    return candidates[:max_candidates]
+
+
+def nl_to_graph_query(natural_language_question: str, num_ctx: int = 4096) -> dict:
+    """
+    Translate a natural language question to a structured graph query.
+    Uses Ollama (small/fast model) — maps freeform question to:
+        {entity: str, relation_filter: str | None, max_hops: int, intent: str}
+
+    Implements the neuro-symbolic integration pattern (H-010):
+    LLM → formal query → symbolic graph execution.
+    The LLM provides flexibility; graph execution provides exactness.
+
+    Returns dict with keys: entity, relation_filter, max_hops, intent, raw_question
+    """
+    # Use a fast local model for NL parsing — haiku-style role
+    NL_MODEL = os.environ.get("NL_QUERY_MODEL", GRAPH_MODEL)
+
+    prompt = f"""You are a knowledge graph query parser. Convert the user's natural language question
+into a structured graph query. Return ONLY valid JSON, nothing else.
+
+The knowledge graph contains academic/technical vault notes with entities like:
+"attention mechanism", "spaced repetition", "hormesis", "curriculum learning",
+"convex", "linesheet", "dopamine", "reinforcement learning", etc.
+
+Question: {natural_language_question}
+
+Return this exact JSON structure:
+{{
+  "entity": "primary entity to look up (lowercase, 2-4 words max)",
+  "relation_filter": null or one of ["builds_on", "contradicts", "applies_to", "implements", "extends", "part_of", "uses", "enables", "related_to", "causes", "measured_by", "equivalent_to", "produces", "involves"],
+  "max_hops": 1 or 2,
+  "intent": "one sentence describing what the user wants to know"
+}}
+
+Rules:
+- entity: the most specific single concept the question is about (not a sentence)
+- relation_filter: null unless the question specifically asks about a relation type
+- max_hops: 2 if the question is multi-hop ("what connects X to Y?"), else 1
+- Use null for relation_filter when the question asks about all connections
+- Return ONLY the JSON, no preamble or explanation"""
+
+    response = ollama_generate(prompt, model=NL_MODEL)
+    response = response.strip()
+
+    # Strip markdown code fences if present
+    if response.startswith("```"):
+        response = re.sub(r'^```\w*\n?', '', response)
+        response = re.sub(r'\n?```$', '', response)
+
+    try:
+        parsed = json.loads(response)
+        return {
+            "entity":          parsed.get("entity", ""),
+            "relation_filter": parsed.get("relation_filter", None),
+            "max_hops":        int(parsed.get("max_hops", 1)),
+            "intent":          parsed.get("intent", natural_language_question),
+            "raw_question":    natural_language_question,
+        }
+    except (json.JSONDecodeError, ValueError):
+        # Fallback: extract likely entity keywords from question (skip question words and short tokens)
+        _QUESTION_WORDS = {
+            "what", "which", "who", "where", "when", "why", "how", "does", "is", "are",
+            "was", "were", "will", "would", "could", "should", "the", "and", "with",
+            "that", "this", "from", "have", "has", "about", "between", "connect", "connects",
+            "connected", "relate", "relates", "related", "show", "shows", "explain",
+        }
+        tokens = re.findall(r"[a-zA-Z]+", natural_language_question.lower())
+        entity_tokens = [t for t in tokens if len(t) > 4 and t not in _QUESTION_WORDS]
+        fallback_entity = " ".join(entity_tokens[:3]) if entity_tokens else natural_language_question[:40]
+        return {
+            "entity":          fallback_entity,
+            "relation_filter": None,
+            "max_hops":        1,
+            "intent":          f"Find connections for: {natural_language_question}",
+            "raw_question":    natural_language_question,
+        }
+
+
+def ask_graph(conn, question: str, hops: int | None = None) -> None:
+    """
+    Natural language interface to the knowledge graph.
+    Implements H-010: NL-to-graph-query translation layer for vault-graph.py.
+
+    Pipeline:
+    1. NL question → structured query (LLM translation)
+    2. Entity name → fuzzy lookup in graph DB (exact + substring + token matching)
+    3. Symbolic graph traversal on resolved entity
+    4. Formatted answer with provenance
+
+    Usage: python3 vault-graph.py ask <vault_root> "What does hormesis connect to in ML?"
+    """
+    print(f"\nQuery: {question}")
+    print("─" * 60)
+
+    # Step 1: Parse NL → structured query
+    print("Parsing question...", end=" ", flush=True)
+    parsed = nl_to_graph_query(question)
+    entity_hint  = parsed["entity"]
+    rel_filter   = parsed["relation_filter"]
+    max_hops_q   = hops if hops is not None else parsed["max_hops"]
+    intent       = parsed["intent"]
+
+    print(f"done")
+    print(f"Entity hint:     {entity_hint!r}")
+    print(f"Relation filter: {rel_filter!r}")
+    print(f"Max hops:        {max_hops_q}")
+    print(f"Intent:          {intent}")
+    print()
+
+    # Step 2: Fuzzy entity lookup
+    if not entity_hint.strip():
+        print("Could not extract a query entity from the question.")
+        return
+
+    candidates = fuzzy_entity_lookup(conn, entity_hint)
+
+    if not candidates:
+        print(f"No entities found matching '{entity_hint}' in the knowledge graph.")
+        print("Tip: Try a more specific term, or check 'vault-graph.py stats' for entity coverage.")
+        return
+
+    print(f"Resolved entity candidates ({len(candidates)}):")
+    for i, c in enumerate(candidates[:5]):
+        n_rels = conn.execute(
+            "SELECT COUNT(*) FROM relations WHERE source_entity=? OR target_entity=?",
+            (c, c)
+        ).fetchone()[0]
+        print(f"  [{i+1}] {c!r} ({n_rels} relations)")
+    print()
+
+    # Step 3: Graph traversal on top candidate
+    top_entity = candidates[0]
+    print(f"Traversing graph for: {top_entity!r} (hops={max_hops_q})")
+    if rel_filter:
+        print(f"Filtering to relation type: {rel_filter!r}")
+    print("─" * 60)
+
+    visited = set()
+    to_visit = [(top_entity, 0)]
+    results = []
+
+    while to_visit:
+        entity_name, depth = to_visit.pop(0)
+        if entity_name in visited or depth > max_hops_q:
+            continue
+        visited.add(entity_name)
+
+        indent = "  " * depth
+
+        # Entity info
+        sources = conn.execute(
+            "SELECT DISTINCT type, source_file FROM entities WHERE name = ?",
+            (entity_name,)
+        ).fetchall()
+
+        if sources or depth == 0:
+            types = sorted(set(s[0] for s in sources)) if sources else ["unknown"]
+            files = sorted(set(s[1] for s in sources)) if sources else []
+            short_files = [Path(f).stem for f in files[:3]]
+            print(f"{indent}[{', '.join(types)}] {entity_name}")
+            if short_files:
+                print(f"{indent}  notes: {', '.join(short_files)}")
+
+        # Outgoing relations (with optional filter)
+        if rel_filter:
+            outgoing = conn.execute(
+                "SELECT relation, target_entity, source_file FROM relations "
+                "WHERE source_entity = ? AND relation = ?",
+                (entity_name, rel_filter)
+            ).fetchall()
+        else:
+            outgoing = conn.execute(
+                "SELECT relation, target_entity, source_file FROM relations "
+                "WHERE source_entity = ?",
+                (entity_name,)
+            ).fetchall()
+
+        # Incoming relations (with optional filter)
+        if rel_filter:
+            incoming = conn.execute(
+                "SELECT source_entity, relation, source_file FROM relations "
+                "WHERE target_entity = ? AND relation = ?",
+                (entity_name, rel_filter)
+            ).fetchall()
+        else:
+            incoming = conn.execute(
+                "SELECT source_entity, relation, source_file FROM relations "
+                "WHERE target_entity = ?",
+                (entity_name,)
+            ).fetchall()
+
+        if outgoing:
+            for rel, target, src in outgoing:
+                print(f"{indent}  → {rel} → {target}")
+                if depth < max_hops_q and target not in visited:
+                    to_visit.append((target, depth + 1))
+                results.append({"direction": "out", "entity": entity_name, "rel": rel, "other": target})
+
+        if incoming:
+            for source, rel, src in incoming:
+                print(f"{indent}  ← {source} ← {rel}")
+                if depth < max_hops_q and source not in visited:
+                    to_visit.append((source, depth + 1))
+                results.append({"direction": "in", "entity": entity_name, "rel": rel, "other": source})
+
+        if not outgoing and not incoming and depth > 0:
+            print(f"{indent}  (no connections at this depth)")
+
+        print()
+
+    # Summary
+    n_nodes = len(visited)
+    n_edges = len(results)
+    print(f"─" * 60)
+    print(f"Traversal complete: {n_nodes} entities, {n_edges} relations")
+    if len(candidates) > 1:
+        print(f"\nOther matching entities (not traversed): {', '.join(repr(c) for c in candidates[1:5])}")
+        print("Re-run with 'query <root> <entity_name>' for a specific entity.")
+
+
 def show_stats(conn):
     """Show graph statistics."""
     entity_count = conn.execute("SELECT COUNT(*) FROM entities").fetchone()[0]
@@ -627,18 +905,89 @@ def normalize_db_types(conn):
             print(f"  {c:4d}  '{r}'")
 
 
+def prune_orphans(conn, dry_run=False):
+    """
+    Remove entities with no relations and relations pointing to non-existent entities.
+
+    Two passes:
+      1. Dangling relations — source_entity or target_entity not present in entities.name
+      2. Orphan entities — entities.name not referenced in any relation (source or target)
+
+    Reports counts for both passes. With --dry-run prints counts without deleting.
+    """
+    # --- Pass 1: dangling relations ---
+    dangling = conn.execute("""
+        SELECT id FROM relations
+        WHERE source_entity NOT IN (SELECT DISTINCT name FROM entities)
+           OR target_entity  NOT IN (SELECT DISTINCT name FROM entities)
+    """).fetchall()
+    dangling_ids = [r[0] for r in dangling]
+
+    # --- Pass 2: orphan entities (zero relations in either direction) ---
+    orphans = conn.execute("""
+        SELECT DISTINCT name FROM entities
+        WHERE name NOT IN (SELECT DISTINCT source_entity FROM relations)
+          AND name NOT IN (SELECT DISTINCT target_entity  FROM relations)
+    """).fetchall()
+    orphan_names = [r[0] for r in orphans]
+
+    print(f"Dangling relations (reference missing entities): {len(dangling_ids)}")
+    print(f"Orphan entities (zero relations):               {len(orphan_names)}")
+
+    if dry_run:
+        print("[dry-run] No changes written.")
+        if dangling_ids:
+            sample = dangling_ids[:5]
+            rows = conn.execute(
+                f"SELECT source_entity, relation, target_entity FROM relations WHERE id IN ({','.join('?'*len(sample))})",
+                sample
+            ).fetchall()
+            print("  Sample dangling relations:")
+            for src, rel, tgt in rows:
+                print(f"    {src!r} --{rel}--> {tgt!r}")
+        if orphan_names:
+            print(f"  Sample orphan entities: {orphan_names[:10]}")
+        return
+
+    # Delete dangling relations
+    if dangling_ids:
+        conn.execute(
+            f"DELETE FROM relations WHERE id IN ({','.join('?'*len(dangling_ids))})",
+            dangling_ids
+        )
+
+    # Delete orphan entities (all rows for each name)
+    if orphan_names:
+        conn.execute(
+            f"DELETE FROM entities WHERE name IN ({','.join('?'*len(orphan_names))})",
+            orphan_names
+        )
+
+    conn.commit()
+
+    total_removed = len(dangling_ids) + len(orphan_names)
+    print(f"Removed {len(dangling_ids)} dangling relations and {len(orphan_names)} orphan entities.")
+    print(f"Total pruned: {total_removed}")
+
+    # Post-prune stats
+    remaining_entities = conn.execute("SELECT COUNT(DISTINCT name) FROM entities").fetchone()[0]
+    remaining_relations = conn.execute("SELECT COUNT(*) FROM relations").fetchone()[0]
+    print(f"Graph after prune: {remaining_entities} unique entities, {remaining_relations} relations")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Knowledge graph extraction for your notes. "
         "Extracts entities and relationships using a local Ollama model."
     )
     parser.add_argument(
-        "command", choices=["index", "query", "stats", "export", "normalize-db"],
-        help="Command to run"
+        "command", choices=["index", "query", "ask", "stats", "export", "normalize-db", "prune"],
+        help="Command to run ('ask' accepts natural language questions)"
     )
+    _vault_root_default = str(Path(__file__).resolve().parent.parent)
     parser.add_argument(
-        "root", nargs="?", default=".",
-        help="Root directory of your notes (default: current directory)"
+        "root", nargs="?", default=_vault_root_default,
+        help="Root directory of your notes (default: vault root)"
     )
     parser.add_argument(
         "entity", nargs="?", default=None,
@@ -649,6 +998,7 @@ def main():
     parser.add_argument("--top", type=int, default=300, help="Top N entities for export (default: 300)")
     parser.add_argument("--min-connections", type=int, default=2, help="Min connections for export (default: 2)")
     parser.add_argument("--db", type=str, default=None, help="Database path (default: auto per root dir)")
+    parser.add_argument("--dry-run", action="store_true", help="prune: show what would be removed without deleting")
 
     args = parser.parse_args()
 
@@ -659,6 +1009,8 @@ def main():
         db_path = db_path_for_root(root)
 
     conn = sqlite3.connect(db_path)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=30000")
     init_tables(conn)
 
     if args.command == "index":
@@ -668,12 +1020,22 @@ def main():
             print("Usage: vault-graph.py query <root> <entity>")
             return
         query_entity(conn, args.entity, args.hops)
+    elif args.command == "ask":
+        if not args.entity:
+            print("Usage: vault-graph.py ask [root] \"natural language question\"")
+            print("Example: vault-graph.py ask \"What connects hormesis to curriculum learning?\"")
+            return
+        # For 'ask', args.entity is the natural language question
+        # Reassemble if split across multiple words (shell may split it)
+        ask_graph(conn, args.entity, hops=args.hops if args.hops != 1 else None)
     elif args.command == "stats":
         show_stats(conn)
     elif args.command == "export":
         export_graph(conn, top=args.top, min_connections=args.min_connections)
     elif args.command == "normalize-db":
         normalize_db_types(conn)
+    elif args.command == "prune":
+        prune_orphans(conn, dry_run=args.dry_run)
 
     conn.close()
 
