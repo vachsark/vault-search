@@ -85,18 +85,35 @@ Relationship types are normalized to 15 canonical types: `relates_to`, `builds_o
 
 ### vault-search.py — Search with graph context
 
-Hybrid search that combines semantic similarity with keyword matching. When graph tables exist in the database, results automatically include a "Graph Context" section showing entity connections.
+Hybrid search that combines semantic similarity with keyword matching. When graph tables exist in the database, results automatically include a "Graph Context" section showing entity connections. Returns chunk-level results with section headings and line numbers.
 
 ```bash
-python3 vault-search.py "query" ~/notes                  # hybrid search
-python3 vault-search.py "query" ~/notes --rerank          # LLM re-ranking (better quality)
-python3 vault-search.py "query" ~/notes --expand --rerank # full pipeline (HyDE + rerank)
-python3 vault-search.py "query" ~/notes --mode bm25      # keyword-only (fastest)
-python3 vault-search.py "query" ~/notes --no-graph        # skip graph context
-python3 vault-search.py "query" ~/notes --json            # JSON output
-python3 vault-search.py "query" ~/notes --path Projects/  # filter by path
-python3 vault-search.py "query" ~/notes --no-cache        # bypass disk embedding cache
+python3 vault-search.py "query" ~/notes                       # hybrid search
+python3 vault-search.py "query" ~/notes --rerank              # LLM re-ranking (better quality)
+python3 vault-search.py "query" ~/notes --expand --rerank     # full pipeline (HyDE + rerank)
+python3 vault-search.py "query" ~/notes --mode bm25           # keyword-only (fastest)
+python3 vault-search.py "query" ~/notes --no-graph            # skip graph context
+python3 vault-search.py "query" ~/notes --json                # JSON output
+python3 vault-search.py "query" ~/notes --path Projects/      # filter by path
+python3 vault-search.py "query" ~/notes --no-cache            # bypass disk embedding cache
+python3 vault-search.py "query" ~/notes --intent "domain"     # steer HyDE toward a domain
+python3 vault-search.py "query" ~/notes --explain             # show per-result scoring breakdown
 ```
+
+**Typed sub-queries** — mix retrieval strategies in a single query:
+
+```bash
+python3 vault-search.py 'lex:"exact term" vec:"concept" hyde:"question"' ~/notes
+```
+
+| Prefix            | Strategy             | Best for                                   |
+| ----------------- | -------------------- | ------------------------------------------ |
+| `lex:"term"`      | BM25 keyword match   | Exact identifiers, code symbols            |
+| `vec:"concept"`   | Embedding similarity | Conceptual / semantic queries              |
+| `hyde:"question"` | HyDE expansion       | Exploratory "what is / how does" questions |
+| (unprefixed)      | Hybrid (default)     | General use                                |
+
+Results from each sub-query are fused via Reciprocal Rank Fusion before re-ranking.
 
 ### verify-citations.py — Check URLs in markdown files
 
@@ -130,6 +147,7 @@ python3 synthesis-suggest.py ~/notes                    # top 10 candidates
 python3 synthesis-suggest.py ~/notes --top 20
 python3 synthesis-suggest.py ~/notes --min-jaccard 0.25 # stricter threshold
 python3 synthesis-suggest.py ~/notes --json             # machine-readable output
+python3 synthesis-suggest.py ~/notes --ucb              # UCB exploration bonus (up-weights under-explored entities)
 ```
 
 Requires discipline-prefixed filenames (`discipline--topic.md` naming convention). If your notes use a different convention, set `DISCIPLINE_SEPARATOR` in the script.
