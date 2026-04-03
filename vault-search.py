@@ -13,16 +13,23 @@ When entity/relation tables are present (populated by vault-graph.py),
 search results automatically include a "Graph Context" section showing
 how matching concepts connect to each other.
 
+Includes a catalyst index: pre-computed thematic questions per entity that
+enable sub-millisecond concept lookup without Ollama.
+
 Usage:
-    python3 vault-search.py "authentication middleware"
-    python3 vault-search.py "convex schema design" --top 10
-    python3 vault-search.py "React hooks" --path Projects/
-    python3 vault-search.py "getTenantId" --mode bm25
-    python3 vault-search.py "auth patterns" --rerank        # LLM re-ranking
-    python3 vault-search.py "auth patterns" --expand --rerank  # full pipeline
-    python3 vault-search.py "attention" --intent "machine learning"  # intent steering
-    python3 vault-search.py 'lex:"reciprocal rank" vec:search fusion' # typed sub-queries
-    python3 vault-search.py "auth patterns" --explain        # scoring details
+    vault-search init ~/my-vault           # Build FTS5 index + catalysts
+    vault-search "authentication middleware"
+    vault-search "convex schema design" --top 10
+    vault-search "React hooks" --path Projects/
+    vault-search "getTenantId" --mode bm25
+    vault-search "auth patterns" --rerank        # LLM re-ranking
+    vault-search "auth patterns" --expand --rerank  # full pipeline
+    vault-search "attention" --intent "machine learning"  # intent steering
+    vault-search 'lex:"reciprocal rank" vec:search fusion' # typed sub-queries
+    vault-search "auth patterns" --explain        # scoring details
+    vault-search "auth patterns" --fast           # catalyst-only sub-ms lookup
+    vault-search "auth patterns" --no-embeddings  # BM25 + catalysts, no Ollama
+    vault-search status                           # show index stats
 
 Typed sub-queries:
     lex:"term"     BM25 keyword search for that term
@@ -84,6 +91,13 @@ RERANK_MODEL = os.environ.get("RERANK_MODEL", "qwen3.5:9b")  # updated from qwen
 
 RERANK_TOP_N = 20   # Candidates to re-rank from retrieval stage
 RERANK_BLEND_K = 5  # Position-aware blending: top-k results trust retrieval more
+
+# Set True via --no-embeddings to skip all Ollama embedding calls
+_NO_EMBEDDINGS: bool = False
+
+
+class EmbeddingsUnavailable(Exception):
+    """Raised when embeddings are disabled or Ollama is unreachable."""
 CROSS_ENCODER_MODEL = os.environ.get(
     "CROSS_ENCODER_MODEL", "cross-encoder/ms-marco-MiniLM-L-6-v2"
 )
@@ -293,6 +307,8 @@ def _save_disk_cache(text: str, emb: list[float]) -> None:
 
 
 def ollama_embed(text: str) -> list[float]:
+    if _NO_EMBEDDINGS:
+        raise EmbeddingsUnavailable("Embeddings disabled via --no-embeddings")
     # 1. In-memory cache (process-lifetime, instant)
     if text in _embed_cache:
         return _embed_cache[text]
@@ -1145,22 +1161,54 @@ def search(
         conn.close()
         return results
 
-    # Get query embedding
+    # Get query embedding (optional — falls back to BM25+catalysts if unavailable)
     embed_query = query
-    if expand:
+    if expand and not _NO_EMBEDDINGS:
         print("Expanding query with HyDE...", file=sys.stderr)
         t0 = time.time()
         embed_query = hyde_expand(query, intent)
         _explain(f"HyDE expansion ({(time.time()-t0)*1000:.0f}ms): {embed_query[:100]}...")
 
     t0 = time.time()
+    q_emb = None
     try:
         q_emb = ollama_embed(embed_query)
+        _explain(f"Embedding query ({(time.time()-t0)*1000:.0f}ms)")
+    except EmbeddingsUnavailable:
+        _explain("Embeddings disabled — using BM25+catalysts only")
     except Exception as e:
-        print(f"Error: Cannot reach Ollama at {OLLAMA_BASE}: {e}", file=sys.stderr)
-        print("Make sure Ollama is running: ollama serve", file=sys.stderr)
-        sys.exit(1)
-    _explain(f"Embedding query ({(time.time()-t0)*1000:.0f}ms)")
+        if _NO_EMBEDDINGS:
+            _explain("Embeddings disabled — using BM25+catalysts only")
+        else:
+            print(f"Warning: Cannot reach Ollama at {OLLAMA_BASE}: {e}", file=sys.stderr)
+            print("Falling back to BM25+catalysts. Use --no-embeddings to silence this.",
+                  file=sys.stderr)
+
+    # If embeddings unavailable, fall back to BM25 (+ catalyst context appended by caller)
+    if q_emb is None:
+        _explain("BM25-only fallback path")
+        words = [w for w in re.findall(r'\w+', query.lower()) if len(w) >= 3]
+        if not words:
+            conn.close()
+            return []
+        bm25_results = bm25_search(conn, query, path_filter, limit=top_k * 3)
+        if not bm25_results:
+            conn.close()
+            return []
+        paths_in = ", ".join("?" * len(bm25_results))
+        path_list = [p for p, _ in bm25_results]
+        sm: dict[str, str] = {}
+        for p, s in conn.execute(
+            f"SELECT path, summary FROM files WHERE path IN ({paths_in})", path_list
+        ).fetchall():
+            sm[p] = s or ""
+        results = [(score, path, sm.get(path, ""), None, None)
+                   for path, score in bm25_results[:top_k]]
+        if explain:
+            _explain(f"Final: {len(results)} results (BM25 fallback)")
+            _print_explain(explain_log, results)
+        conn.close()
+        return results
 
     # Check chunks
     has_chunks = False
@@ -1412,6 +1460,216 @@ def search(
 
     conn.close()
     return fused
+
+
+# ---------------------------------------------------------------------------
+# Catalyst index — pre-computed thematic questions for sub-ms entity lookup
+# ---------------------------------------------------------------------------
+
+def _catalyst_index_exists(conn: sqlite3.Connection) -> bool:
+    """Check if the catalyst FTS5 table exists and has data."""
+    try:
+        count = conn.execute("SELECT COUNT(*) FROM catalysts").fetchone()[0]
+        return count > 0
+    except Exception:
+        return False
+
+
+def _get_top_catalyst_entities(conn: sqlite3.Connection, limit: int = 200) -> list:
+    """Get entities ranked by mention count — most connected = most useful as catalysts."""
+    try:
+        return conn.execute("""
+            SELECT name, type, COUNT(*) as mentions
+            FROM entities
+            GROUP BY name
+            ORDER BY mentions DESC
+            LIMIT ?
+        """, (limit,)).fetchall()
+    except Exception:
+        return []
+
+
+def _get_entity_context(conn: sqlite3.Connection, entity_name: str) -> tuple:
+    """Get the notes and relations for an entity."""
+    notes = conn.execute(
+        "SELECT DISTINCT source_file FROM entities WHERE name = ?",
+        (entity_name,)
+    ).fetchall()
+    relations = conn.execute(
+        "SELECT source_entity, relation, target_entity FROM relations "
+        "WHERE source_entity = ? OR target_entity = ? LIMIT 10",
+        (entity_name, entity_name)
+    ).fetchall()
+    return [r[0] for r in notes], relations
+
+
+def _generate_catalyst_questions(entity_name: str, entity_type: str,
+                                  notes: list, relations: list) -> list[str]:
+    """Generate 3-5 catalyst questions for an entity WITHOUT an LLM call.
+
+    Derived from knowledge graph structure alone — instant, free, deterministic.
+    """
+    questions = []
+    related = set()
+    for src, rel, tgt in relations:
+        other = tgt if src == entity_name else src
+        related.add(other)
+
+    # Q1: What is this?
+    questions.append(f"What is {entity_name} and how does it work?")
+
+    # Q2: What connects to it?
+    if related:
+        sample = list(related)[:3]
+        questions.append(f"How does {entity_name} relate to {', '.join(sample)}?")
+
+    # Q3: Type-specific
+    if entity_type == "concept":
+        questions.append(f"What are the key mechanisms behind {entity_name}?")
+    elif entity_type == "technique":
+        questions.append(f"How is {entity_name} applied in practice?")
+    elif entity_type == "theory":
+        questions.append(f"What evidence supports or challenges {entity_name}?")
+    elif entity_type == "person":
+        questions.append(f"What contributions did {entity_name} make?")
+    else:
+        questions.append(f"What are the implications of {entity_name}?")
+
+    # Q4: Cross-domain (if notes span multiple domain prefixes)
+    note_prefixes = set()
+    for n in notes:
+        parts = Path(n).stem.split('--')
+        if len(parts) >= 2:
+            note_prefixes.add(parts[0])
+    if len(note_prefixes) >= 2:
+        questions.append(
+            f"How does {entity_name} bridge {' and '.join(list(note_prefixes)[:3])}?"
+        )
+
+    # Q5: Coverage
+    if len(notes) > 3:
+        questions.append(
+            f"What are the most important aspects of {entity_name} "
+            f"across {len(notes)} vault notes?"
+        )
+
+    return questions
+
+
+def build_catalyst_index(conn: sqlite3.Connection, limit: int = 200,
+                          verbose: bool = False) -> int:
+    """Build (or rebuild) the catalyst FTS5 table in the given DB connection.
+
+    Returns the number of entities indexed.
+    """
+    # Check graph tables exist
+    tables = {r[0] for r in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'"
+    ).fetchall()}
+    if "entities" not in tables or "relations" not in tables:
+        if verbose:
+            print("  No entity/relation tables found — skipping catalyst index", file=sys.stderr)
+        return 0
+
+    entities = _get_top_catalyst_entities(conn, limit)
+    if not entities:
+        if verbose:
+            print("  No entities found — skipping catalyst index", file=sys.stderr)
+        return 0
+
+    # Drop and recreate tables
+    conn.execute("DROP TABLE IF EXISTS catalysts_fts")
+    conn.execute("DROP TABLE IF EXISTS catalysts")
+    conn.execute("""
+        CREATE TABLE catalysts (
+            entity TEXT NOT NULL,
+            type TEXT,
+            mentions INTEGER,
+            questions TEXT,
+            notes TEXT
+        )
+    """)
+    conn.execute("""
+        CREATE VIRTUAL TABLE catalysts_fts USING fts5(
+            entity, questions, content=catalysts, content_rowid=rowid
+        )
+    """)
+
+    total_questions = 0
+    for name, etype, mentions in entities:
+        notes, relations = _get_entity_context(conn, name)
+        questions = _generate_catalyst_questions(name, etype or "concept", notes, relations)
+        q_text = " ".join(questions)
+        n_text = " ".join(notes[:5])
+        conn.execute(
+            "INSERT INTO catalysts (entity, type, mentions, questions, notes) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (name, etype, mentions, q_text, n_text)
+        )
+        conn.execute(
+            "INSERT INTO catalysts_fts (rowid, entity, questions) "
+            "VALUES (last_insert_rowid(), ?, ?)",
+            (name, q_text)
+        )
+        total_questions += len(questions)
+
+    conn.commit()
+    return len(entities)
+
+
+def catalyst_search(conn: sqlite3.Connection, query: str,
+                     top: int = 5) -> list[dict]:
+    """Sub-millisecond catalyst lookup via FTS5.
+
+    Returns a list of dicts with entity, type, mentions, questions, notes, elapsed_ms.
+    """
+    if not _catalyst_index_exists(conn):
+        return []
+
+    words = [w for w in query.split() if len(w) > 2]
+    if not words:
+        return []
+
+    fts_query = " OR ".join(words)
+    t0 = time.time()
+    try:
+        rows = conn.execute("""
+            SELECT c.entity, c.type, c.mentions, c.questions, c.notes, rank
+            FROM catalysts_fts
+            JOIN catalysts c ON c.rowid = catalysts_fts.rowid
+            WHERE catalysts_fts MATCH ?
+            ORDER BY rank
+            LIMIT ?
+        """, (fts_query, top)).fetchall()
+    except Exception:
+        return []
+    elapsed = (time.time() - t0) * 1000
+
+    results = []
+    for entity, etype, mentions, questions, notes, rank in rows:
+        results.append({
+            "entity": entity,
+            "type": etype,
+            "mentions": mentions,
+            "questions": [q.strip() + "?" for q in questions.split("?") if q.strip()],
+            "notes": [n for n in (notes or "").split() if n],
+            "elapsed_ms": elapsed,
+        })
+    return results
+
+
+def _print_catalyst_results(results: list[dict], query: str) -> None:
+    """Print catalyst search results to stdout."""
+    if not results:
+        print(f"No catalyst results for: {query}")
+        return
+    elapsed = results[0].get("elapsed_ms", 0) if results else 0
+    print(f"Catalyst results for: {query}  ({elapsed:.2f}ms)\n")
+    for r in results:
+        print(f"  {r['entity']} ({r['type']}, {r['mentions']} mentions)")
+        for q in r['questions'][:3]:
+            print(f"    - {q}")
+        print()
 
 
 # ---------------------------------------------------------------------------
@@ -1705,87 +1963,74 @@ def graph_context(db_path: Path, query: str, result_paths: list[str]) -> str | N
 
 # ---------------------------------------------------------------------------
 
-def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Local semantic search over files indexed by vault-index.py"
-    )
-    parser.add_argument(
-        "query", type=str,
-        help="Search query"
-    )
-    _vault_root = str(Path(__file__).resolve().parent.parent)
-    parser.add_argument(
-        "root", nargs="?", type=str, default=_vault_root,
-        help="Root directory that was indexed (default: vault root)"
-    )
-    parser.add_argument(
-        "--top", type=int, default=5,
-        help="Number of results (default: 5)"
-    )
-    parser.add_argument(
-        "--path", type=str, default=None,
-        help="Filter results to files under this path prefix"
-    )
-    parser.add_argument(
-        "--db", type=str, default=None,
-        help="Database path (default: auto per root dir)"
-    )
-    parser.add_argument(
-        "--json", action="store_true",
-        help="Output results as JSON"
-    )
-    parser.add_argument(
-        "--mode", choices=["hybrid", "semantic", "bm25"], default="hybrid",
-        help="Search mode (default: hybrid)"
-    )
-    parser.add_argument(
-        "--expand", action="store_true",
-        help="HyDE query expansion — generates a hypothetical document "
-             "before embedding (adds ~1s, improves recall)"
-    )
-    parser.add_argument(
-        "--rerank", action="store_true",
-        help="Re-rank top candidates using LLM scoring (adds ~2-3s, "
-             "significantly improves quality)"
-    )
-    parser.add_argument(
-        "--intent", type=str, default=None,
-        help="Domain context to steer search (e.g., 'machine learning' "
-             "disambiguates 'attention'). Affects expansion, reranking, "
-             "and snippet extraction."
-    )
-    parser.add_argument(
-        "--explain", action="store_true",
-        help="Show scoring details at each pipeline stage (for debugging)"
-    )
-    parser.add_argument(
-        "--no-graph", action="store_true",
-        help="Skip graph context output"
-    )
-    parser.add_argument(
-        "--no-cache", action="store_true",
-        help="Bypass disk embedding cache — always call Ollama (for fresh embeddings "
-             "or after model changes)"
-    )
-    parser.add_argument(
-        "--iterate", action="store_true",
-        help="Two-pass iterative retrieval: extract key terms from pass-1 results "
-             "and run a second search with expanded query. Improves recall for "
-             "multi-concept queries and cross-references (adds ~50%% more time)."
-    )
-    args = parser.parse_args()
+def _cmd_init(root: Path, db_path: Path, catalyst_limit: int = 200) -> None:
+    """Build catalysts from the existing index (FTS5 + graph must already exist)."""
+    if not db_path.exists():
+        print(f"Error: No index found at {db_path}", file=sys.stderr)
+        print(f"Run vault-index.py {root} first to build the FTS5 index.", file=sys.stderr)
+        sys.exit(1)
 
-    # Apply --no-cache flag to module-level global before any embed calls
-    if args.no_cache:
-        global _disk_cache_enabled
-        _disk_cache_enabled = False
+    conn = sqlite3.connect(str(db_path))
 
-    root = Path(args.root).resolve()
-    if args.db:
-        db_path = Path(args.db)
+    # Count what's already there
+    try:
+        file_count = conn.execute("SELECT COUNT(*) FROM files").fetchone()[0]
+    except Exception:
+        file_count = 0
+
+    print(f"Index: {db_path}")
+    print(f"Files indexed: {file_count}")
+
+    # Build catalyst index
+    t0 = time.time()
+    n = build_catalyst_index(conn, limit=catalyst_limit, verbose=True)
+    elapsed = time.time() - t0
+
+    if n > 0:
+        total_q = conn.execute("SELECT COUNT(*) FROM catalysts").fetchone()[0]
+        print(f"Catalyst index: {n} entities, {total_q} rows ({elapsed:.1f}s)")
     else:
-        db_path = db_path_for_root(root)
+        print("Catalyst index: skipped (no entity/relation tables — run vault-graph.py first)")
 
+    conn.close()
+
+
+def _cmd_status(db_path: Path) -> None:
+    """Show index statistics."""
+    if not db_path.exists():
+        print(f"No index at {db_path}")
+        print("Run: vault-search init <vault-root>")
+        return
+
+    conn = sqlite3.connect(str(db_path))
+    stats = {}
+
+    for table, label in [
+        ("files", "files indexed"),
+        ("chunks", "chunks"),
+        ("entities", "entities"),
+        ("relations", "relations"),
+        ("communities", "community memberships"),
+        ("catalysts", "catalyst entries"),
+    ]:
+        try:
+            stats[label] = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+        except Exception:
+            stats[label] = None
+
+    conn.close()
+
+    print(f"Index: {db_path}")
+    print(f"Size:  {db_path.stat().st_size / 1024 / 1024:.1f} MB")
+    for label, count in stats.items():
+        if count is not None:
+            print(f"  {label}: {count:,}")
+        else:
+            print(f"  {label}: (table not present)")
+
+
+def _run_search_and_print(args, db_path: Path) -> None:
+    """Shared search + output logic for the main search path."""
     if args.iterate:
         results = iterative_search(
             args.query,
@@ -1828,18 +2073,20 @@ def main() -> None:
                 if spread < 0.05:
                     low_conf = True
         else:
-            # hybrid or bm25: use relative spread
             if len(results) >= 3:
                 top3 = [r[0] for r in results[:3]]
                 spread = max(top3) - min(top3)
-                # If all top results have nearly identical RRF scores, retrieval is uncertain
                 if spread < 0.003:
                     low_conf = True
         if low_conf:
             print("[LOW CONFIDENCE] Top results may not be relevant — "
                   "consider refining your query", file=sys.stderr)
 
-    # Collect result paths for graph context
+    # Optionally append catalyst context to results
+    if getattr(args, 'fast', False) or getattr(args, 'no_embeddings', False):
+        # Catalyst results already printed or will be shown in --fast mode
+        pass
+
     result_paths = [r[1] for r in results]
 
     if args.json:
@@ -1858,7 +2105,6 @@ def main() -> None:
             if c_lines:
                 entry["chunk_lines"] = list(c_lines)
             output.append(entry)
-        # Add graph context to JSON output
         if not args.no_graph:
             gc = graph_context(db_path, args.query, result_paths)
             if gc:
@@ -1882,11 +2128,138 @@ def main() -> None:
             print(f"        {short_summary}")
             print()
 
-        # Graph context at the end
         if not args.no_graph:
             gc = graph_context(db_path, args.query, result_paths)
             if gc:
                 print(gc)
+
+        # Catalyst context appended to BM25/no-embeddings results
+        if getattr(args, 'no_embeddings', False) and db_path.exists():
+            conn = sqlite3.connect(str(db_path))
+            if _catalyst_index_exists(conn):
+                cat_results = catalyst_search(conn, args.query, top=3)
+                if cat_results:
+                    elapsed = cat_results[0].get("elapsed_ms", 0)
+                    print(f"\n── Catalyst Context ({elapsed:.2f}ms) ──")
+                    for r in cat_results[:3]:
+                        print(f"  {r['entity']} ({r['type']}, {r['mentions']} mentions)")
+                        for q in r['questions'][:2]:
+                            print(f"    - {q}")
+            conn.close()
+
+
+def main() -> None:
+    _vault_root = str(Path(__file__).resolve().parent.parent)
+
+    parser = argparse.ArgumentParser(
+        description="Local semantic search over files indexed by vault-index.py",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Commands:
+  vault-search init [root]      Build catalyst index from existing FTS5/graph index
+  vault-search status [root]    Show index statistics
+  vault-search "query" [root]   Search (hybrid BM25 + embeddings, default)
+
+Flags:
+  --fast            Catalyst-only sub-ms entity lookup (no file search)
+  --no-embeddings   BM25 + catalysts only, no Ollama required
+  --top N           Number of results (default: 5)
+  --path PREFIX     Filter results to files under this path
+  --mode            hybrid|semantic|bm25 (default: hybrid)
+  --expand          HyDE query expansion
+  --rerank          LLM re-ranking
+  --intent DOMAIN   Domain context to disambiguate queries
+  --iterate         Two-pass iterative retrieval
+  --explain         Show scoring details
+  --no-graph        Skip graph context
+  --no-cache        Bypass embedding disk cache
+  --json            Output as JSON
+"""
+    )
+    parser.add_argument(
+        "query", type=str,
+        help="Search query, or 'init' / 'status' subcommand"
+    )
+    parser.add_argument(
+        "root", nargs="?", type=str, default=_vault_root,
+        help="Root directory that was indexed (default: vault root)"
+    )
+    parser.add_argument("--top", type=int, default=5)
+    parser.add_argument("--path", type=str, default=None)
+    parser.add_argument("--db", type=str, default=None)
+    parser.add_argument("--json", action="store_true")
+    parser.add_argument(
+        "--mode", choices=["hybrid", "semantic", "bm25"], default="hybrid"
+    )
+    parser.add_argument("--expand", action="store_true")
+    parser.add_argument("--rerank", action="store_true")
+    parser.add_argument("--intent", type=str, default=None)
+    parser.add_argument("--explain", action="store_true")
+    parser.add_argument("--no-graph", action="store_true", dest="no_graph")
+    parser.add_argument("--no-cache", action="store_true", dest="no_cache")
+    parser.add_argument("--iterate", action="store_true")
+    # New flags
+    parser.add_argument(
+        "--fast", action="store_true",
+        help="Catalyst-only sub-ms entity lookup (no file search, no Ollama)"
+    )
+    parser.add_argument(
+        "--no-embeddings", action="store_true", dest="no_embeddings",
+        help="BM25 + catalysts only — skip all Ollama embedding calls"
+    )
+    parser.add_argument(
+        "--catalyst-limit", type=int, default=200, dest="catalyst_limit",
+        help="Number of top entities to index as catalysts (default: 200)"
+    )
+
+    args = parser.parse_args()
+
+    # Apply flags to module-level globals
+    if args.no_cache:
+        global _disk_cache_enabled
+        _disk_cache_enabled = False
+
+    if args.no_embeddings or args.fast:
+        global _NO_EMBEDDINGS
+        _NO_EMBEDDINGS = True
+
+    # Resolve root + DB path
+    root = Path(args.root).resolve()
+    if args.db:
+        db_path = Path(args.db)
+    else:
+        db_path = db_path_for_root(root)
+
+    # --- Subcommands ---
+    if args.query == "init":
+        _cmd_init(root, db_path, catalyst_limit=args.catalyst_limit)
+        return
+
+    if args.query == "status":
+        _cmd_status(db_path)
+        return
+
+    # --- --fast: catalyst-only path ---
+    if args.fast:
+        if not db_path.exists():
+            print(f"Error: No index at {db_path}. Run: vault-search init {root}",
+                  file=sys.stderr)
+            sys.exit(1)
+        conn = sqlite3.connect(str(db_path))
+        if not _catalyst_index_exists(conn):
+            print("No catalyst index found. Run: vault-search init", file=sys.stderr)
+            conn.close()
+            sys.exit(1)
+        results = catalyst_search(conn, args.query, top=args.top)
+        conn.close()
+        if args.json:
+            print(json.dumps(results, indent=2))
+        else:
+            _print_catalyst_results(results, args.query)
+        return
+
+    # --- Standard search path ---
+    _run_search_and_print(args, db_path)
 
 
 if __name__ == "__main__":
