@@ -1894,9 +1894,11 @@ def graph_context(db_path: Path, query: str, result_paths: list[str]) -> str | N
         # Rank entities: relevance for sorting, raw connection count for display
         entity_info = {}  # {name: (sort_score, raw_connections)}
         for ent, relevance in matched_entities.items():
+            # Distinct edges: the same fact extracted from several notes counts once
             count = conn.execute(
-                "SELECT COUNT(*) FROM (SELECT id FROM relations WHERE source_entity=? "
-                "UNION ALL SELECT id FROM relations WHERE target_entity=?)",
+                "SELECT COUNT(*) FROM (SELECT relation, target_entity FROM relations "
+                "WHERE source_entity=? UNION SELECT relation, source_entity FROM relations "
+                "WHERE target_entity=?)",
                 (ent, ent)
             ).fetchone()[0]
             entity_info[ent] = (relevance * max(count, 1), count)
@@ -1916,19 +1918,23 @@ def graph_context(db_path: Path, query: str, result_paths: list[str]) -> str | N
 
             # Get top relations (outgoing)
             outgoing = conn.execute(
-                "SELECT relation, target_entity FROM relations WHERE source_entity = ? LIMIT 5",
+                "SELECT DISTINCT relation, target_entity FROM relations "
+                "WHERE source_entity = ? LIMIT 25",
                 (ent,)
             ).fetchall()
-            for rel, target in outgoing:
-                lines.append(f"    → {_norm_rel(rel)} → {target}")
+            seen_out = list(dict.fromkeys((_norm_rel(rel), target) for rel, target in outgoing))
+            for rel, target in seen_out[:5]:
+                lines.append(f"    → {rel} → {target}")
 
             # Get top relations (incoming)
             incoming = conn.execute(
-                "SELECT source_entity, relation FROM relations WHERE target_entity = ? LIMIT 3",
+                "SELECT DISTINCT source_entity, relation FROM relations "
+                "WHERE target_entity = ? LIMIT 15",
                 (ent,)
             ).fetchall()
-            for source, rel in incoming:
-                lines.append(f"    ← {source} ← {_norm_rel(rel)}")
+            seen_in = list(dict.fromkeys((source, _norm_rel(rel)) for source, rel in incoming))
+            for source, rel in seen_in[:3]:
+                lines.append(f"    ← {source} ← {rel}")
 
         # --- Community context (Leiden) ---
         community_lines = []
@@ -1996,6 +2002,19 @@ def graph_context(db_path: Path, query: str, result_paths: list[str]) -> str | N
 
 # ---------------------------------------------------------------------------
 
+def _index_has_embeddings(db_path: Path) -> bool:
+    """True if any file in the index has an embedding (False for BM25-only indexes)."""
+    try:
+        conn = sqlite3.connect(str(db_path))
+        row = conn.execute(
+            "SELECT 1 FROM files WHERE embedding IS NOT NULL LIMIT 1"
+        ).fetchone()
+        conn.close()
+        return row is not None
+    except Exception:
+        return True  # unknown — let the normal path decide
+
+
 def _cmd_init(root: Path, db_path: Path, catalyst_limit: int = 200) -> None:
     """Build catalysts from the existing index (FTS5 + graph must already exist)."""
     if not db_path.exists():
@@ -2062,6 +2081,74 @@ def _cmd_status(db_path: Path) -> None:
             print(f"  {label}: (table not present)")
 
 
+def _has_real_summary(summary: str | None) -> bool:
+    """False for empty, not-yet-generated, or failed summaries."""
+    s = (summary or "").strip()
+    return bool(s) and s != "(pending)" and not s.startswith("(summary failed")
+
+
+def _title_and_snippet(content: str, query: str, width: int = 160) -> tuple[str | None, str | None]:
+    """Pull a display title and a query-matching snippet from raw note text.
+
+    Used when a file has no LLM summary (e.g. BM25-only index), so results
+    still show what the note is about instead of a blank line.
+    """
+    lines = content.splitlines()
+    title = None
+    body_start = 0
+    # Skip YAML frontmatter, picking up `title:` if present
+    if lines and lines[0].strip() == "---":
+        for i, line in enumerate(lines[1:], 1):
+            if line.strip() == "---":
+                body_start = i + 1
+                break
+            if line.lower().startswith("title:"):
+                title = line.split(":", 1)[1].strip().strip("'\"") or None
+    body = [l.strip() for l in lines[body_start:] if l.strip()]
+    if title is None:
+        for line in body:
+            if line.startswith("#"):
+                title = line.lstrip("#").strip() or None
+                break
+    text_lines = [l for l in body if not l.startswith("#")]
+    if not text_lines:
+        return title, None
+
+    query = re.sub(r"\b(lex|vec|hyde):", " ", query.lower())  # typed sub-query prefixes
+    terms = [w for w in re.findall(r"\w+", query) if len(w) >= 3]
+    snippet_line, pos = text_lines[0], 0
+    for line in text_lines:
+        low = line.lower()
+        hits = [low.find(t) for t in terms if t in low]
+        if hits:
+            snippet_line, pos = line, min(hits)
+            break
+    # Window around the match, but never cut a line that fits and never end short
+    start = min(max(0, pos - width // 3), max(0, len(snippet_line) - width))
+    snippet = snippet_line[start:start + width]
+    if start > 0:
+        snippet = "..." + snippet
+    if start + width < len(snippet_line):
+        snippet += "..."
+    return title, snippet
+
+
+def _load_contents(db_path: Path, paths: list[str]) -> dict[str, str]:
+    """Fetch stored note text for the given result paths (empty on any error)."""
+    if not paths:
+        return {}
+    try:
+        conn = sqlite3.connect(str(db_path))
+        rows = conn.execute(
+            f"SELECT path, content FROM files WHERE path IN ({', '.join('?' * len(paths))})",
+            paths,
+        ).fetchall()
+        conn.close()
+        return {p: (c or "") for p, c in rows}
+    except Exception:
+        return {}
+
+
 def _run_search_and_print(args, db_path: Path) -> None:
     """Shared search + output logic for the main search path."""
     if args.iterate:
@@ -2121,6 +2208,10 @@ def _run_search_and_print(args, db_path: Path) -> None:
         pass
 
     result_paths = [r[1] for r in results]
+    # Fall back to title + snippet from the note itself when there's no summary
+    contents = _load_contents(
+        db_path, [r[1] for r in results if not _has_real_summary(r[2])]
+    )
 
     if args.json:
         output = []
@@ -2133,6 +2224,12 @@ def _run_search_and_print(args, db_path: Path) -> None:
                 "path": path,
                 "summary": summary,
             }
+            if path in contents:
+                title, snippet = _title_and_snippet(contents[path], args.query)
+                if title:
+                    entry["title"] = title
+                if snippet:
+                    entry["snippet"] = snippet
             if c_heading:
                 entry["chunk_heading"] = c_heading
             if c_lines:
@@ -2151,14 +2248,22 @@ def _run_search_and_print(args, db_path: Path) -> None:
             score, path, summary = result[0], result[1], result[2]
             c_heading = result[3] if len(result) > 3 else None
             c_lines = result[4] if len(result) > 4 else None
-            short_summary = summary.replace("\n", " ").strip()
-            if len(short_summary) > 100:
-                short_summary = short_summary[:97] + "..."
             print(f"{score:.4f}  {path}")
             if c_heading:
                 line_info = f" (lines {c_lines[0]}-{c_lines[1]})" if c_lines else ""
                 print(f"        \u00a7 {c_heading}{line_info}")
-            print(f"        {short_summary}")
+            title, snippet = (_title_and_snippet(contents[path], args.query)
+                              if path in contents else (None, None))
+            if title or snippet:
+                if title:
+                    print(f"        {title}")
+                if snippet:
+                    print(f'        "{snippet}"')
+            else:
+                short_summary = summary.replace("\n", " ").strip()
+                if len(short_summary) > 100:
+                    short_summary = short_summary[:97] + "..."
+                print(f"        {short_summary}")
             print()
 
         if not args.no_graph:
@@ -2292,6 +2397,16 @@ Flags:
         return
 
     # --- Standard search path ---
+    # A BM25-only index (built without Ollama) has nothing to compare a query
+    # embedding against, so skip Ollama entirely instead of warning every run.
+    if not _NO_EMBEDDINGS and db_path.exists() and not _index_has_embeddings(db_path):
+        if args.mode == "semantic":
+            print("This index has no embeddings (it was built without Ollama).\n"
+                  "Start Ollama and re-run vault-index.py, or use --mode bm25.",
+                  file=sys.stderr)
+            sys.exit(1)
+        _NO_EMBEDDINGS = True
+        args.no_embeddings = True
     _run_search_and_print(args, db_path)
 
 

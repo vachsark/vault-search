@@ -30,7 +30,7 @@ $ python3 vault-search.py "how does reinforcement learning relate to dopamine" ~
 
 ## Quick start
 
-No Ollama required for the fast path — BM25 + catalysts work out of the box with zero dependencies.
+No Ollama required for the fast path — BM25 + catalysts work out of the box with zero dependencies. Without Ollama, results show each note's title and the matching line; start Ollama and re-run `vault-index.py` later to add semantic search and summaries.
 
 ```bash
 # Clone and index
@@ -162,13 +162,13 @@ python3 vault-graph.py index ~/notes
 python3 vault-graph.py query ~/notes "attention" --hops 2
 
 # Find the shortest conceptual path between two ideas
-python3 knowledge-path.py "prospect theory" "transformer architecture"
+python3 knowledge-path.py "prospect theory" "transformer architecture" --root ~/notes
 
 # Trace causal chains
-python3 causal-trace.py "cortisol" "decision making"
+python3 causal-trace.py "cortisol" "decision making" --root ~/notes
 
 # Find cross-domain synthesis candidates
-VAULT_DIR=~/notes python3 synthesis-suggest.py
+python3 synthesis-suggest.py --root ~/notes
 ```
 
 Entity types: `concept`, `technique`, `theory`, `person`, `field`, `system`, `anatomy`, `biology`, `event`, `publication`
@@ -178,8 +178,8 @@ Relationship types are normalized from 500+ LLM-invented variants to 15 canonica
 **Leiden community detection** — cluster your knowledge graph into topic communities and find bridge concepts spanning multiple domains:
 
 ```bash
-python3 leiden-communities.py --vault-root ~/notes --query "dopamine"  # which community?
-python3 leiden-communities.py --vault-root ~/notes --stats-only       # community overview
+python3 leiden-communities.py --root ~/notes --query "dopamine"  # which community?
+python3 leiden-communities.py --root ~/notes --stats-only       # community overview
 ```
 
 ---
@@ -199,7 +199,7 @@ Typical use: pipe search results directly into your LLM context instead of full 
 python3 vault-search.py "how does X work" ~/notes --json | jq '(.results? // .)[:5]'
 
 # Or ask directly (uses vault-search internally, then synthesizes)
-python3 vault-ask.py "What does my vault know about scheduling optimization?"
+python3 vault-ask.py "What does my vault know about scheduling optimization?" --root ~/notes
 ```
 
 ---
@@ -274,6 +274,16 @@ Skipped: images, PDFs, archives, binaries, lock files, `node_modules`, `.git`, b
 - `pip install leidenalg python-igraph` — optional, for community detection
 
 No other dependencies. Uses only Python stdlib + SQLite + optional Ollama HTTP API.
+
+---
+
+## Development
+
+```bash
+python3 -m unittest discover -s tests -v
+```
+
+The smoke tests build a throwaway vault and run every CLI tool end to end, using a tiny in-process stand-in for the Ollama API. No Ollama, network or third-party packages needed.
 
 ---
 

@@ -14,6 +14,7 @@ Usage:
 
 import argparse
 import json
+import os
 import sys
 import time
 import urllib.request
@@ -39,7 +40,7 @@ db_path_for_root = _search_mod.db_path_for_root
 
 VAULT_ROOT = Path(__file__).resolve().parent.parent
 VAULT_DB = db_path_for_root(VAULT_ROOT)
-OLLAMA_BASE = "http://localhost:11434"
+OLLAMA_BASE = os.environ.get("OLLAMA_BASE", "http://localhost:11434")
 DEFAULT_MODEL = "qwen3.5:9b"
 CODE_MODEL = "qwen2.5-coder:14b"
 MAX_CONTEXT_CHARS = 12000  # How much retrieved content to include in prompt
@@ -167,6 +168,10 @@ def main() -> None:
     )
     parser.add_argument("question", type=str, help="Your question")
     parser.add_argument(
+        "--root", type=str, default=None,
+        help="Vault root that was indexed (default: parent of this script's directory)"
+    )
+    parser.add_argument(
         "--top", type=int, default=7,
         help="Number of files to retrieve (default: 7)"
     )
@@ -187,6 +192,11 @@ def main() -> None:
         help="Output as JSON (answer + sources + metadata)"
     )
     args = parser.parse_args()
+
+    if args.root:
+        global VAULT_ROOT, VAULT_DB
+        VAULT_ROOT = Path(args.root).resolve()
+        VAULT_DB = db_path_for_root(VAULT_ROOT)
 
     t0 = time.time()
     answer = ask(

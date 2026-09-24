@@ -19,6 +19,7 @@ Usage:
 """
 import argparse
 import glob
+import hashlib
 import json
 import os
 import re
@@ -229,6 +230,33 @@ def find_implementation(entity: str, forward: dict) -> list[dict]:
     return implementations
 
 
+def find_db(root: str | None) -> str | None:
+    """Index DB for --root (same hashing as vault-index.py). Without --root,
+    honor VAULT_SEARCH_DB, else fall back to the largest index on disk."""
+    custom = os.environ.get("VAULT_SEARCH_DB")
+    if custom:
+        return custom
+    base = Path.home() / ".local/share/vault-search"
+    if root:
+        root_hash = hashlib.sha256(str(Path(root).resolve()).encode()).hexdigest()[:12]
+        return str(base / f"{root_hash}.db")
+    dbs = sorted(glob.glob(str(base / "*.db")),
+                 key=lambda p: Path(p).stat().st_size, reverse=True)
+    # Prefer the largest index that actually has a knowledge graph
+    for db in dbs:
+        try:
+            conn = sqlite3.connect(db)
+            has_graph = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='relations'"
+            ).fetchone()
+            conn.close()
+        except sqlite3.Error:
+            continue
+        if has_graph:
+            return db
+    return dbs[0] if dbs else None
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Trace causal/mechanistic chains through the knowledge graph"
@@ -245,20 +273,20 @@ def main():
                         help="Also follow edges in reverse direction when forward BFS "
                              "finds no path. Fixes cases where the graph edge points "
                              "target→source instead of source→target.")
+    parser.add_argument("--root", type=str, default=None,
+                        help="Vault root that was indexed (default: largest index on disk)")
 
     args = parser.parse_args()
 
     # Find DB
-    dbs = sorted(
-        glob.glob(str(Path.home() / ".local/share/vault-search/*.db")),
-        key=lambda p: Path(p).stat().st_size,
-        reverse=True,
-    )
-    if not dbs:
-        print("No vault-search database found", file=sys.stderr)
+    db = find_db(args.root)
+    if not db or not Path(db).exists():
+        where = f" for {args.root}" if args.root else ""
+        print(f"No vault-search database found{where}. "
+              f"Run: vault-index.py <vault> && vault-graph.py index <vault>", file=sys.stderr)
         sys.exit(1)
 
-    forward, reverse = load_graph(dbs[0])
+    forward, reverse = load_graph(db)
 
     chain = trace_causal_chain(forward, reverse, args.start, args.end,
                                max_depth=args.max_depth,
