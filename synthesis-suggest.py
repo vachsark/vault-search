@@ -15,6 +15,7 @@ Usage:
 """
 import argparse
 import glob
+import hashlib
 import json
 import math
 import os
@@ -27,9 +28,36 @@ VAULT_DIR = os.environ.get("VAULT_DIR", "/home/veech/Documents/TestVault")
 KNOWLEDGE_DIR = os.path.join(VAULT_DIR, "Knowledge")
 
 
+def find_db(root: str | None) -> str | None:
+    """Index DB for --root (same hashing as vault-index.py). Without --root,
+    honor VAULT_SEARCH_DB, else fall back to the largest index on disk."""
+    custom = os.environ.get("VAULT_SEARCH_DB")
+    if custom:
+        return custom
+    base = Path.home() / ".local/share/vault-search"
+    if root:
+        root_hash = hashlib.sha256(str(Path(root).resolve()).encode()).hexdigest()[:12]
+        return str(base / f"{root_hash}.db")
+    dbs = sorted(glob.glob(str(base / "*.db")),
+                 key=lambda p: Path(p).stat().st_size, reverse=True)
+    # Prefer the largest index that actually has a knowledge graph
+    for db in dbs:
+        try:
+            conn = sqlite3.connect(db)
+            has_graph = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='relations'"
+            ).fetchone()
+            conn.close()
+        except sqlite3.Error:
+            continue
+        if has_graph:
+            return db
+    return dbs[0] if dbs else None
+
+
 def suggest_synthesis(top: int = 10, min_jaccard: float = 0.15,
                       min_shared: int = 3, ucb: bool = False,
-                      ucb_c: float = 1.0) -> list[dict]:
+                      ucb_c: float = 1.0, db_path: str | None = None) -> list[dict]:
     """Find high-potential cross-discipline synthesis candidates.
 
     When ucb=True (SYN-2026-03-22-008), applies a UCB1 exploration bonus that
@@ -43,15 +71,11 @@ def suggest_synthesis(top: int = 10, min_jaccard: float = 0.15,
     """
 
     # Find DB
-    dbs = sorted(
-        glob.glob(str(Path.home() / ".local/share/vault-search/*.db")),
-        key=lambda p: Path(p).stat().st_size,
-        reverse=True,
-    )
-    if not dbs:
+    db = db_path or find_db(None)
+    if not db or not Path(db).exists():
         return []
 
-    conn = sqlite3.connect(dbs[0])
+    conn = sqlite3.connect(db)
 
     # Build graph + entity-to-note mapping
     graph: dict[str, set[str]] = defaultdict(set)
@@ -78,7 +102,8 @@ def suggest_synthesis(top: int = 10, min_jaccard: float = 0.15,
     # N(entity) = number of synthesis notes mentioning that entity.
     entity_synthesis_count: dict[str, int] = defaultdict(int)
     total_synthesis_notes = 0
-    for f in os.listdir(KNOWLEDGE_DIR):
+    # Vaults without a Knowledge/ folder simply have no existing synthesis notes
+    for f in (os.listdir(KNOWLEDGE_DIR) if os.path.isdir(KNOWLEDGE_DIR) else []):
         if f.startswith("synthesis--") and f.endswith(".md"):
             total_synthesis_notes += 1
             # Extract title words from filename for dedup
@@ -301,10 +326,22 @@ def main():
                         help="Apply UCB exploration bonus for under-explored entities (SYN-008)")
     parser.add_argument("--ucb-c", type=float, default=1.0,
                         help="UCB exploration constant (default 1.0; higher = more exploration)")
+    parser.add_argument("--root", type=str, default=None,
+                        help="Vault root that was indexed (default: $VAULT_DIR / largest index)")
     args = parser.parse_args()
 
+    db = find_db(args.root)
+    if args.root:
+        global VAULT_DIR, KNOWLEDGE_DIR
+        VAULT_DIR = str(Path(args.root).resolve())
+        KNOWLEDGE_DIR = os.path.join(VAULT_DIR, "Knowledge")
+        if not db or not Path(db).exists():
+            print(f"No vault-search database found for {args.root}. "
+                  f"Run: vault-index.py <vault> && vault-graph.py index <vault>", file=sys.stderr)
+            sys.exit(1)
+
     candidates = suggest_synthesis(top=args.top, min_jaccard=args.min_jaccard,
-                                   ucb=args.ucb, ucb_c=args.ucb_c)
+                                   ucb=args.ucb, ucb_c=args.ucb_c, db_path=db)
 
     if args.json:
         print(json.dumps(candidates, indent=2))

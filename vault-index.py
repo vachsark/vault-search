@@ -574,13 +574,13 @@ def run_index(vault_root: Path, sub_path: Path | None, db_path: Path,
         batch_meta.append((rel, chash, fpath, text))
 
         if len(batch_texts) >= BATCH_SIZE:
-            print(f"  [{i}/{total}] Embedding batch of {len(batch_texts)}...")
+            print(f"  [{i}/{total}] {'Indexing' if bm25_only else 'Embedding'} batch of {len(batch_texts)}...")
             flush_batch()
             batch_texts.clear()
             batch_meta.clear()
 
     if batch_texts:
-        print(f"  Embedding final batch of {len(batch_texts)}...")
+        print(f"  {'Indexing' if bm25_only else 'Embedding'} final batch of {len(batch_texts)}...")
         flush_batch()
         batch_texts.clear()
         batch_meta.clear()
@@ -687,6 +687,9 @@ def run_index(vault_root: Path, sub_path: Path | None, db_path: Path,
           + (f", {err_count} errors" if err_count else "") + ")")
     print(f"Total: {total_files} files, {chunk_count} chunks across {chunked_files} files")
     print(f"Database: {db_path}")
+    if bm25_only:
+        print("\nBM25-only index ready. Search with:\n"
+              f"  python3 vault-search.py \"your query\" {vault_root}")
     conn.close()
 
 
@@ -745,7 +748,7 @@ def main() -> None:
     print(f"Database: {db_path}")
     print(f"Models:   embed={EMBED_MODEL}, summary={SUMMARY_MODEL}")
     if args.no_summary:
-        print(f"Mode:     embeddings only (no summaries)")
+        print("Mode:     no summaries")
     print()
 
     t0 = time.time()

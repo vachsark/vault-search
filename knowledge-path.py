@@ -12,6 +12,8 @@ Usage:
 """
 import argparse
 import glob
+import hashlib
+import os
 import sqlite3
 import sys
 from collections import defaultdict, deque
@@ -147,6 +149,45 @@ def find_all_paths(graph: dict[str, set[str]], start: str, end: str,
     return paths
 
 
+def find_db(root: str | None) -> str | None:
+    """Index DB for --root (same hashing as vault-index.py). Without --root,
+    honor VAULT_SEARCH_DB, else fall back to the largest index on disk."""
+    custom = os.environ.get("VAULT_SEARCH_DB")
+    if custom:
+        return custom
+    base = Path.home() / ".local/share/vault-search"
+    if root:
+        root_hash = hashlib.sha256(str(Path(root).resolve()).encode()).hexdigest()[:12]
+        return str(base / f"{root_hash}.db")
+    dbs = sorted(glob.glob(str(base / "*.db")),
+                 key=lambda p: Path(p).stat().st_size, reverse=True)
+    # Prefer the largest index that actually has a knowledge graph
+    for db in dbs:
+        try:
+            conn = sqlite3.connect(db)
+            has_graph = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='relations'"
+            ).fetchone()
+            conn.close()
+        except sqlite3.Error:
+            continue
+        if has_graph:
+            return db
+    return dbs[0] if dbs else None
+
+
+def _hint_missing(graph: dict[str, set[str]], args) -> None:
+    """Explain a miss caused by an endpoint that isn't in the (pruned) graph."""
+    for name in (args.start, args.end):
+        term = name.lower().strip()
+        if not any(term in e for e in graph):  # same fuzzy rule as find_path
+            if args.include_leaves:
+                print(f"  '{name}' is not an entity in the graph.")
+            else:
+                print(f"  '{name}' is not in the graph (it may have only one connection). "
+                      f"Try --include-leaves.")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Find conceptual paths between two ideas in the knowledge graph"
@@ -162,21 +203,20 @@ def main():
     parser.add_argument("--include-leaves", action="store_true",
                         help="Include degree-1 entities (leaf nodes / mentions). "
                              "Default: pruned to degree>=2 for shorter, more meaningful paths")
+    parser.add_argument("--root", type=str, default=None,
+                        help="Vault root that was indexed (default: largest index on disk)")
 
     args = parser.parse_args()
 
     # Find the database
-    dbs = sorted(
-        glob.glob(str(Path.home() / ".local/share/vault-search/*.db")),
-        key=lambda p: Path(p).stat().st_size,
-        reverse=True,
-    )
-
-    if not dbs:
-        print("No vault-search database found", file=sys.stderr)
+    db = find_db(args.root)
+    if not db or not Path(db).exists():
+        where = f" for {args.root}" if args.root else ""
+        print(f"No vault-search database found{where}. "
+              f"Run: vault-index.py <vault> && vault-graph.py index <vault>", file=sys.stderr)
         sys.exit(1)
 
-    graph = build_graph(dbs[0], prune_leaves=not args.include_leaves)
+    graph = build_graph(db, prune_leaves=not args.include_leaves)
 
     if args.stats:
         n_edges = sum(len(v) for v in graph.values()) // 2
@@ -197,6 +237,7 @@ def main():
         else:
             print(f"No path found between '{args.start}' and '{args.end}' "
                   f"within {args.max_hops} hops")
+            _hint_missing(graph, args)
     else:
         path = find_path(graph, args.start, args.end, max_depth=args.max_hops)
         if path:
@@ -206,6 +247,7 @@ def main():
         else:
             print(f"No path found between '{args.start}' and '{args.end}' "
                   f"within {args.max_hops} hops")
+            _hint_missing(graph, args)
 
 
 if __name__ == "__main__":

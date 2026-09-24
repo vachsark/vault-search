@@ -537,7 +537,7 @@ def main():
                         help="Print stats without re-running detection")
     parser.add_argument("--no-store", action="store_true",
                         help="Don't store results in DB (dry run)")
-    parser.add_argument("--vault-root", type=str, default=None,
+    parser.add_argument("--vault-root", "--root", type=str, default=None,
                         help="Vault root path (auto-detected if not given)")
 
     args = parser.parse_args()
@@ -552,6 +552,14 @@ def main():
         sys.exit(1)
 
     conn = sqlite3.connect(db)
+    has_graph = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='relations'"
+    ).fetchone()
+    if not has_graph:
+        print(f"ERROR: No knowledge graph in {db}. Run vault-graph.py index {vault_root} first.",
+              file=sys.stderr)
+        conn.close()
+        sys.exit(1)
 
     # Query mode: just look up an entity
     if args.query:
