@@ -43,6 +43,8 @@ Environment variables:
     EXPAND_MODEL      HyDE expansion model (default: qwen3.5:9b)
     RERANK_MODEL      Re-ranking model (default: qwen3.5:9b)
     VAULT_SEARCH_DB   Database path override (default: auto per root dir)
+    VAULT_SEARCH_CACHE_DIR  Disk embedding cache directory
+                            (default: ~/.cache/vault-search/embed-cache)
 """
 
 import argparse
@@ -205,7 +207,9 @@ def vectorized_search(
     summaries = []
 
     for i, (path, blob, enorm, summary) in enumerate(rows):
-        if len(blob) == dims * 8:
+        if blob is None:
+            pass  # not embedded yet (BM25-only index) — scores 0 via zero norm
+        elif len(blob) == dims * 8:
             emb_matrix[i] = np.frombuffer(blob, dtype=np.float64).astype(np.float32)
         elif len(blob) == dims * 2:
             emb_matrix[i] = np.frombuffer(blob, dtype=np.float16).astype(np.float32)
@@ -271,8 +275,12 @@ _embed_cache: dict[str, list[float]] = {}
 _EMBED_CACHE_MAX = 64
 
 # Disk embedding cache — persists across runs; keyed by sha256(model:text)
-_VAULT_ROOT = Path(__file__).resolve().parent.parent
-EMBED_DISK_CACHE_DIR = _VAULT_ROOT / "_data" / "embed-cache"
+EMBED_DISK_CACHE_DIR = Path(
+    os.environ.get(
+        "VAULT_SEARCH_CACHE_DIR",
+        str(Path.home() / ".cache" / "vault-search" / "embed-cache"),
+    )
+)
 _disk_cache_enabled: bool = True  # set to False via --no-cache
 
 
@@ -1050,10 +1058,28 @@ def search(
             ).fetchall()
         summary_map = {path: (summary or "") for path, _, _, summary in rows}
 
+        # Embeddings are optional: on failure, skip the semantic list (BM25 still runs)
+        embed_warned = False
+
+        def try_embed(text: str) -> list[float] | None:
+            nonlocal embed_warned
+            try:
+                return ollama_embed(text)
+            except Exception as e:
+                if not _NO_EMBEDDINGS and not embed_warned:
+                    print(f"Warning: Cannot reach Ollama at {OLLAMA_BASE}: {e}", file=sys.stderr)
+                    print("Falling back to BM25+catalysts. Use --no-embeddings to silence this.",
+                          file=sys.stderr)
+                    embed_warned = True
+                _explain(f"Embeddings unavailable — skipping semantic search for \"{text[:60]}\"")
+                return None
+
         # vec: sub-queries → embedding search only
         for vq in subqueries["vec"]:
             t0 = time.time()
-            vq_emb = ollama_embed(vq)
+            vq_emb = try_embed(vq)
+            if vq_emb is None:
+                continue
             if HAS_NUMPY and all(isinstance(r[1], bytes) for r in rows[:10]):
                 sem = vectorized_search(rows, vq_emb, vq, path_filter)
             else:
@@ -1064,8 +1090,12 @@ def search(
         # hyde: sub-queries → HyDE expansion + embedding search
         for hq in subqueries["hyde"]:
             t0 = time.time()
+            if _NO_EMBEDDINGS:
+                continue
             expanded = hyde_expand(hq, intent)
-            hq_emb = ollama_embed(expanded)
+            hq_emb = try_embed(expanded)
+            if hq_emb is None:
+                continue
             if HAS_NUMPY and all(isinstance(r[1], bytes) for r in rows[:10]):
                 sem = vectorized_search(rows, hq_emb, hq, path_filter)
             else:
@@ -1076,8 +1106,10 @@ def search(
         # plain text → normal hybrid
         for pq in subqueries["plain"]:
             t0 = time.time()
-            pq_emb = ollama_embed(pq)
-            if HAS_NUMPY and all(isinstance(r[1], bytes) for r in rows[:10]):
+            pq_emb = try_embed(pq)
+            if pq_emb is None:
+                sem = []
+            elif HAS_NUMPY and all(isinstance(r[1], bytes) for r in rows[:10]):
                 sem = vectorized_search(rows, pq_emb, pq, path_filter)
             else:
                 sem = _fallback_semantic(rows, pq_emb, pq)
@@ -1264,7 +1296,8 @@ def search(
         semantic_results.sort(key=lambda x: x[0], reverse=True)
 
     _explain(f"Semantic search → {len(semantic_results)} results, "
-             f"top={semantic_results[0][0]:.4f} ({(time.time()-t0)*1000:.0f}ms)")
+             f"top={semantic_results[0][0] if semantic_results else 0:.4f} "
+             f"({(time.time()-t0)*1000:.0f}ms)")
 
     # Chunk-level search — find the best matching chunk per file
     # Performance: limit chunk search to top-N candidate files from semantic + BM25 results.

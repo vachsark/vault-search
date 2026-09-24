@@ -37,7 +37,7 @@ No Ollama required for the fast path — BM25 + catalysts work out of the box wi
 git clone https://github.com/vachsark/vault-search
 cd vault-search
 
-# Index your vault (BM25 only — no Ollama needed)
+# Index your vault (BM25 only — no Ollama needed; re-run with Ollama up to add embeddings)
 python3 vault-index.py ~/my-obsidian-vault --no-summary
 
 # Search
@@ -48,7 +48,8 @@ python3 vault-search.py "reinforcement learning and dopamine" ~/my-obsidian-vaul
 
 ```bash
 ollama pull qwen3-embedding:0.6b   # embeddings (~500MB)
-ollama pull qwen3:8b               # graph extraction + reranking (optional)
+ollama pull qwen3.5:9b             # graph extraction + reranking (optional)
+ollama pull qwen2.5-coder:7b       # per-file summaries (optional; skip with --no-summary)
 
 python3 vault-index.py ~/my-obsidian-vault
 python3 vault-graph.py index ~/my-obsidian-vault
@@ -167,7 +168,7 @@ python3 knowledge-path.py "prospect theory" "transformer architecture"
 python3 causal-trace.py "cortisol" "decision making"
 
 # Find cross-domain synthesis candidates
-python3 synthesis-suggest.py ~/notes
+VAULT_DIR=~/notes python3 synthesis-suggest.py
 ```
 
 Entity types: `concept`, `technique`, `theory`, `person`, `field`, `system`, `anatomy`, `biology`, `event`, `publication`
@@ -177,8 +178,8 @@ Relationship types are normalized from 500+ LLM-invented variants to 15 canonica
 **Leiden community detection** — cluster your knowledge graph into topic communities and find bridge concepts spanning multiple domains:
 
 ```bash
-python3 leiden-communities.py --query "dopamine"    # which community?
-python3 leiden-communities.py --stats-only           # community overview
+python3 leiden-communities.py --vault-root ~/notes --query "dopamine"  # which community?
+python3 leiden-communities.py --vault-root ~/notes --stats-only       # community overview
 ```
 
 ---
@@ -195,7 +196,7 @@ Typical use: pipe search results directly into your LLM context instead of full 
 
 ```bash
 # Get ranked context for an LLM prompt — 5-8K tokens instead of 90K
-python3 vault-search.py "how does X work" ~/notes --json | jq '.results[:5]'
+python3 vault-search.py "how does X work" ~/notes --json | jq '(.results? // .)[:5]'
 
 # Or ask directly (uses vault-search internally, then synthesizes)
 python3 vault-ask.py "What does my vault know about scheduling optimization?"
@@ -246,9 +247,10 @@ All settings via environment variables:
 | ------------------------ | --------------------------------------- | ---------------------- |
 | `OLLAMA_BASE`            | `http://localhost:11434`                | Ollama API URL         |
 | `EMBED_MODEL`            | `qwen3-embedding:0.6b`                  | Embedding model        |
-| `GRAPH_MODEL`            | `qwen3:8b`                              | Graph extraction model |
-| `EXPAND_MODEL`           | `qwen3:8b`                              | HyDE expansion model   |
-| `RERANK_MODEL`           | `qwen3:8b`                              | Re-ranking model       |
+| `GRAPH_MODEL`            | `qwen3.5:9b`                            | Graph extraction model |
+| `EXPAND_MODEL`           | `qwen3.5:9b`                            | HyDE expansion model   |
+| `SUMMARY_MODEL`          | `qwen2.5-coder:7b`                      | File summary model     |
+| `RERANK_MODEL`           | `qwen3.5:9b`                            | Re-ranking model       |
 | `VAULT_SEARCH_DB`        | `~/.local/share/vault-search/<hash>.db` | Database path          |
 | `VAULT_SEARCH_CACHE_DIR` | `~/.cache/vault-search/embed-cache`     | Disk embedding cache   |
 

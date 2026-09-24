@@ -217,10 +217,10 @@ def get_stored_hash(conn: sqlite3.Connection, path: str) -> str | None:
     return row[0] if row else None
 
 
-def upsert_file(conn: sqlite3.Connection, path: str, content_hash: str,
-                 embedding: list[float], summary: str, content: str = "") -> None:
-    blob = pack_embedding(embedding)
-    emb_norm = embedding_norm(embedding)
+def upsert_file(conn: sqlite3.Connection, path: str, content_hash: str | None,
+                 embedding: list[float] | None, summary: str, content: str = "") -> None:
+    blob = pack_embedding(embedding) if embedding is not None else None
+    emb_norm = embedding_norm(embedding) if embedding is not None else None
     conn.execute("""
         INSERT INTO files (path, content_hash, embedding, embedding_norm, summary, content, indexed_at)
         VALUES (?, ?, ?, ?, ?, ?, datetime('now'))
@@ -498,12 +498,17 @@ def run_index(vault_root: Path, sub_path: Path | None, db_path: Path,
         print(f"Error: {root} is not a directory", file=sys.stderr)
         sys.exit(1)
 
+    # Without Ollama, build a BM25-only (FTS5) index. Rows are stored with no
+    # content_hash so the next run with Ollama available re-embeds them.
+    bm25_only = False
     try:
         ollama_embed("connection test")
     except Exception as e:
-        print(f"Error: Cannot reach Ollama at {OLLAMA_BASE}: {e}", file=sys.stderr)
-        print("Make sure Ollama is running: ollama serve", file=sys.stderr)
-        sys.exit(1)
+        print(f"Warning: Cannot reach Ollama at {OLLAMA_BASE}: {e}", file=sys.stderr)
+        print("Building BM25-only index (no embeddings, no summaries). "
+              "Start Ollama (ollama serve) and re-run to add embeddings.", file=sys.stderr)
+        bm25_only = True
+        skip_summary = True
 
     conn = init_db(db_path)
     pruned = prune_missing(conn, vault_root)
@@ -527,6 +532,13 @@ def run_index(vault_root: Path, sub_path: Path | None, db_path: Path,
     def flush_batch() -> None:
         nonlocal new_count, err_count
         if not batch_texts:
+            return
+        if bm25_only:
+            for rel, _, _, raw_text in batch_meta:
+                upsert_file(conn, rel, None, None, "", content=raw_text)
+                new_count += 1
+                print(f"  [+] {rel}")
+            conn.commit()
             return
         try:
             embeddings = ollama_embed_batch(batch_texts)
@@ -574,7 +586,9 @@ def run_index(vault_root: Path, sub_path: Path | None, db_path: Path,
         batch_meta.clear()
 
     # Chunk embedding for large files
-    if rechunk or force:
+    if bm25_only:
+        chunk_candidates = []
+    elif rechunk or force:
         chunk_candidates = conn.execute("SELECT path FROM files").fetchall()
     else:
         chunk_candidates = conn.execute("""
